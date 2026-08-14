@@ -339,17 +339,17 @@ def render_rgbd_from_3dgs(submap):
     depth = render["depth"].squeeze(0).cpu().detach().numpy()
     return color, depth
 
-def get_pcd_from_rgbd(submap):
+def get_rgbd(submap):
     if "start_rgb" in submap and "start_depth" in submap:
-#        print("Using ground truth for point cloud generation.")
-        color = submap["start_rgb"]
-        depth = submap["start_depth"]
+        return submap["start_rgb"], submap["start_depth"]
     elif "gaussian_model_params" in submap:
-#        print("Using rendered image for point cloud generation.")
-        color, depth = render_rgbd_from_3dgs(submap)
+        return render_rgbd_from_3dgs(submap)
     else:
         raise ValueError("No RGB-D data available in the submap.")
-    return rgbd2ptcloud(color, depth, intrinsics=submap["intrinsics"], pose = np.eye(4))
+
+def get_pcd_from_rgbd(submap):
+    color, depth = get_rgbd(submap)
+    return rgbd2ptcloud(color, depth, intrinsics=submap["intrinsics"], pose=np.eye(4))
 
 def coarse_registration(source_cloud, target_cloud) -> np.ndarray:
     """ Coarse registration of point clouds using FPFH features and RANSAC.
@@ -404,6 +404,59 @@ def coarse_registration(source_cloud, target_cloud) -> np.ndarray:
     end_time = time.time()
     print(f"Coarse registration took {end_time - start_time:.2f} seconds")
     return coarse_alignment.transformation
+
+def unproject(u, v, depth, intrinsics):
+    fx, fy = intrinsics[0][0], intrinsics[1][1]
+    cx, cy = intrinsics[0][2], intrinsics[1][2]
+    return [(u - cx) * depth / fx, (v - cy) * depth / fy, depth]
+
+def patch_idx_to_pixel(patch_idx, grid_w, patch_h_px, patch_w_px):
+    row, col = patch_idx // grid_w, patch_idx % grid_w
+    return int((col + 0.5) * patch_w_px), int((row + 0.5) * patch_h_px)
+
+def coarse_registration_dinov2(source_color, source_depth, target_color, target_depth,
+                                source_intrinsics, target_intrinsics,
+                                feature_extractor, distance_threshold=0.05,
+                                min_correspondences=8):
+    """ DINOv2 patch mutual-NN correspondences -> 3D lift via depth -> RANSAC
+        (Umeyama/Kabsch on known correspondences). Returns 4x4 transform or
+        None (caller must fall back to coarse_registration() on None). """
+    from PIL import Image
+    src_tok, (gh, gw), (ph, pw) = feature_extractor.extract_patch_tokens(Image.fromarray(source_color))
+    tgt_tok, _, _ = feature_extractor.extract_patch_tokens(Image.fromarray(target_color))
+
+    sim = src_tok @ tgt_tok.T
+    s2t = sim.argmax(dim=1)
+    t2s = sim.argmax(dim=0)
+    mutual = t2s[s2t] == torch.arange(s2t.shape[0], device=sim.device)
+    matched_src = torch.nonzero(mutual).squeeze(1)
+    if matched_src.numel() < min_correspondences:
+        return None
+    matched_tgt = s2t[matched_src]
+
+    src_pts, tgt_pts = [], []
+    for si, ti in zip(matched_src.tolist(), matched_tgt.tolist()):
+        u_s, v_s = patch_idx_to_pixel(si, gw, ph, pw)
+        u_t, v_t = patch_idx_to_pixel(ti, gw, ph, pw)
+        if v_s >= source_depth.shape[0] or u_s >= source_depth.shape[1]: continue
+        if v_t >= target_depth.shape[0] or u_t >= target_depth.shape[1]: continue
+        d_s, d_t = source_depth[v_s, u_s], target_depth[v_t, u_t]
+        if d_s <= 0 or d_t <= 0: continue
+        src_pts.append(unproject(u_s, v_s, d_s, source_intrinsics))
+        tgt_pts.append(unproject(u_t, v_t, d_t, target_intrinsics))
+
+    if len(src_pts) < min_correspondences:
+        return None
+
+    src_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(src_pts)))
+    tgt_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(tgt_pts)))
+    corres = o3d.utility.Vector2iVector(np.array([[i, i] for i in range(len(src_pts))]))
+    result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
+        src_pcd, tgt_pcd, corres, distance_threshold,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        ransac_n=3,
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 1000))
+    return result.transformation
 
 def tensor_to_jpeg_bytes_cv2(tensor: torch.Tensor, quality: int = 95) -> bytes:
     """

@@ -47,6 +47,26 @@ class DINOFeatureExtractor(BaseFeatureExtractor):
             features = features / features.norm(p=2, dim=1, keepdim=True)
             return features
 
+    def extract_patch_tokens(self, image):
+        """ Returns (tokens, (grid_h, grid_w), (patch_h_px, patch_w_px)).
+            tokens: L2-normalized [num_patches, embed_dim], CLS token dropped.
+            patch_h_px/patch_w_px: patch size in ORIGINAL image pixels
+            (image gets resized by self.preprocess before the model sees it,
+            so token grid index must be rescaled back to original resolution).
+        """
+        with torch.no_grad():
+            inputs = self.preprocess(images=image, return_tensors="pt").to(self.device)
+            outputs = self.model(**inputs)
+            tokens = outputs.last_hidden_state[:, 1:, :]
+            tokens = tokens / tokens.norm(p=2, dim=-1, keepdim=True)
+
+            _, _, h_in, w_in = inputs["pixel_values"].shape
+            patch_size = self.model.config.patch_size
+            grid_h, grid_w = h_in // patch_size, w_in // patch_size
+
+            orig_w, orig_h = image.size  # PIL Image.size = (W, H)
+            return tokens.squeeze(0), (grid_h, grid_w), (orig_h / grid_h, orig_w / grid_w)
+
 
 class NetVLADFeatureExtractor(BaseFeatureExtractor):
     def __init__(self, config: dict) -> None:

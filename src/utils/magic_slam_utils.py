@@ -197,14 +197,19 @@ def register_agents_submaps(agents_submaps: dict, registrations: list,
     return registrations
 
 def register_submaps_depth(agents_submaps: dict, registration: Registration,
-                           initial_transformation_unknown: bool = True):
+                           initial_transformation_unknown: bool = True,
+                           registration_method: str = "fpfh",
+                           feature_extractor=None):
     """ Register two submaps using ICP.
     Args:
         agents_submaps: A dictionary of agent submaps.
         registration: The registration object.
-        initial_transformation_unknown: If True, use FPFH+RANSAC coarse registration as the
+        initial_transformation_unknown: If True, use a coarse registration as the
             initial guess for inter-agent loops. If False, the odometry-based init_transformation
             set by detect_loops() is used directly (assumes a known relative pose between agents).
+        registration_method: "fpfh" (default) or "dinov2" for the coarse registration used
+            when initial_transformation_unknown is True.
+        feature_extractor: DINOv2 feature extractor, required when registration_method="dinov2".
     Returns:
         registration: The registration object with the transformation and fitness updated.
     """
@@ -212,11 +217,20 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
     source_submap = find_submap(registration.source_frame_id, agents_submaps[registration.source_agent_id])
     target_submap = find_submap(registration.target_frame_id, agents_submaps[registration.target_agent_id])
 
-    source_cloud = utils.get_pcd_from_rgbd(source_submap)
-    target_cloud = utils.get_pcd_from_rgbd(target_submap)
+    source_color, source_depth = utils.get_rgbd(source_submap)
+    target_color, target_depth = utils.get_rgbd(target_submap)
+    source_cloud = utils.rgbd2ptcloud(source_color, source_depth, source_submap["intrinsics"], np.eye(4))
+    target_cloud = utils.rgbd2ptcloud(target_color, target_depth, target_submap["intrinsics"], np.eye(4))
 
     if source_submap['agent_id'] != target_submap['agent_id'] and initial_transformation_unknown:
-        registration.init_transformation = coarse_registration(source_cloud, target_cloud)
+        transform = None
+        if registration_method == "dinov2":
+            transform = utils.coarse_registration_dinov2(
+                source_color, source_depth, target_color, target_depth,
+                source_submap["intrinsics"], target_submap["intrinsics"], feature_extractor)
+        if transform is None:
+            transform = utils.coarse_registration(source_cloud, target_cloud)
+        registration.init_transformation = transform
 
     source_cloud.estimate_normals()
     target_cloud.estimate_normals()

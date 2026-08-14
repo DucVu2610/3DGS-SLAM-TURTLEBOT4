@@ -107,7 +107,11 @@ class MAGiCSLAM(object):
                 agents_submaps, inter_loops, register_submaps, max_threads=20)
         elif self.config["submap"]["anchor_data"] == "depth" or self.config["submap"]["anchor_data"] =="render_depth":
             init_unknown = self.config["submap"]["initial_transformation_unknown"]
-            registration_fn = lambda s, r: register_submaps_depth(s, r, init_unknown)
+            reg_method = self.config["submap"].get("registration_method", "fpfh")
+            registration_fn = lambda s, r: register_submaps_depth(
+                s, r, init_unknown,
+                registration_method=reg_method,
+                feature_extractor=loop_detector._feature_extractor if reg_method == "dinov2" else None)
             intra_loops = register_agents_submaps_depth(
                 agents_submaps, intra_loops, registration_fn, max_threads=1)
             inter_loops = register_agents_submaps_depth(

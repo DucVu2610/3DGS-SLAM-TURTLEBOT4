@@ -58,10 +58,11 @@ cam:
   depth_scale: 6553.5
 data:
   agent_ids: [0, 1]
-submap: 
+submap:
   anchor_data: render_depth #pcd, depth, render_depth
   initial_transformation_unknown: True
   PGO_GTSAM: True
+  registration_method: fpfh   # fpfh | dinov2
 keyframing:
   active_keyframing: True
   keyframing_threshold: 0.02 # Alpha per paper
