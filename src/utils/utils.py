@@ -419,8 +419,11 @@ def coarse_registration_dinov2(source_color, source_depth, target_color, target_
                                 feature_extractor, distance_threshold=0.05,
                                 min_correspondences=8):
     """ DINOv2 patch mutual-NN correspondences -> 3D lift via depth -> RANSAC
-        (Umeyama/Kabsch on known correspondences). Returns 4x4 transform or
-        None (caller must fall back to coarse_registration() on None). """
+        (Umeyama/Kabsch on known correspondences).
+    Returns:
+        (transform, num_correspondences) -- transform is a 4x4 np.ndarray or
+        None if there were not enough valid correspondences; num_correspondences
+        is always an int so the caller can log why it failed. """
     from PIL import Image
     src_tok, (gh, gw), (ph, pw) = feature_extractor.extract_patch_tokens(Image.fromarray(source_color))
     tgt_tok, _, _ = feature_extractor.extract_patch_tokens(Image.fromarray(target_color))
@@ -431,7 +434,7 @@ def coarse_registration_dinov2(source_color, source_depth, target_color, target_
     mutual = t2s[s2t] == torch.arange(s2t.shape[0], device=sim.device)
     matched_src = torch.nonzero(mutual).squeeze(1)
     if matched_src.numel() < min_correspondences:
-        return None
+        return None, int(matched_src.numel())
     matched_tgt = s2t[matched_src]
 
     src_pts, tgt_pts = [], []
@@ -446,7 +449,7 @@ def coarse_registration_dinov2(source_color, source_depth, target_color, target_
         tgt_pts.append(unproject(u_t, v_t, d_t, target_intrinsics))
 
     if len(src_pts) < min_correspondences:
-        return None
+        return None, len(src_pts)
 
     src_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(src_pts)))
     tgt_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(tgt_pts)))
@@ -456,7 +459,18 @@ def coarse_registration_dinov2(source_color, source_depth, target_color, target_
         o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
         ransac_n=3,
         criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 1000))
-    return result.transformation
+    return result.transformation, len(src_pts)
+
+def geodesic_rotation_error_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    """ Sign-ambiguity-free rotation error in degrees between two 3x3
+        rotation matrices, via the trace of the relative rotation.
+        Use this instead of comparing quaternions directly with an L2
+        norm -- q and -q represent the same rotation but can have a
+        large L2 distance, which silently corrupts quaternion-diff-based
+        error metrics. """
+    R_err = R_a.T @ R_b
+    cos_angle = np.clip((np.trace(R_err) - 1) / 2, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_angle))
 
 def tensor_to_jpeg_bytes_cv2(tensor: torch.Tensor, quality: int = 95) -> bytes:
     """

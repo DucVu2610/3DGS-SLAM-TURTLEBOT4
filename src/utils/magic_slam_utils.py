@@ -32,6 +32,8 @@ class Registration(object):
         self.transformation = np.eye(4)
         self.inlier_rmse = 100.0
         self.fitness = 0.0
+        self.coarse_method_used = None      # "dinov2" or "fpfh", set in register_submaps_depth
+        self.num_correspondences = None     # only meaningful when a dinov2 attempt was made
 
 
 def refine_map(gaussian_model, agents_datasets: dict, agents_keyframe_ids: dict, agents_c2ws: dict, iterations=3000):
@@ -225,11 +227,17 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
     if source_submap['agent_id'] != target_submap['agent_id'] and initial_transformation_unknown:
         transform = None
         if registration_method == "dinov2":
-            transform = utils.coarse_registration_dinov2(
+            transform, n_corr = utils.coarse_registration_dinov2(
                 source_color, source_depth, target_color, target_depth,
                 source_submap["intrinsics"], target_submap["intrinsics"], feature_extractor)
+            registration.num_correspondences = n_corr
+            print(f"[registration] dinov2 attempt: {n_corr} correspondences "
+                  f"(agent {source_submap['agent_id']} <-> {target_submap['agent_id']})")
         if transform is None:
             transform = utils.coarse_registration(source_cloud, target_cloud)
+            registration.coarse_method_used = "fpfh"
+        else:
+            registration.coarse_method_used = "dinov2"
         registration.init_transformation = transform
 
     source_cloud.estimate_normals()
