@@ -49,9 +49,14 @@ class Agent(object):
         # Add keyframing configurations
         self.active_keyframing = self.config['keyframing']['active_keyframing']
         self.keyframing_threshold = self.config['keyframing']['keyframing_threshold']
+        self.patch_level_check = self.config['keyframing'].get('patch_level_check', False)  # NEW
+        self.patch_novelty_threshold = self.config['keyframing'].get('patch_novelty_threshold', 0.15)  # NEW
+        self.patch_novel_fraction_threshold = self.config['keyframing'].get('patch_novel_fraction_threshold', 0.10)  # NEW
         # Add submapping configurations
         self.active_submapping = self.config['submapping']['active_submapping']
         self.submapping_threshold = self.config['submapping']['submapping_threshold']
+        self.current_frame_image = None                      # NEW -- set each frame in run()
+        self.submap_last_keyframe_patch_tokens = None         # NEW -- reset each new submap
 
         self.estimated_c2ws = torch.empty(len(self.dataset), 4, 4)
         self.gt_c2ws = np2torch(np.array(self.dataset.poses))
@@ -141,6 +146,20 @@ class Agent(object):
                 return True
             return False
 
+    def _patch_level_novelty_check(self) -> bool:
+        """ Supplementary novelty check using patch-level DINOv2 tokens,
+            comparing the current frame against the most recent keyframe's
+            patch tokens (not the full submap history -- kept cheap on purpose).
+            Only meaningful when self.patch_level_check is True and
+            self.submap_last_keyframe_patch_tokens is already populated. """
+        if self.submap_last_keyframe_patch_tokens is None or self.current_frame_image is None:
+            return False
+        tokens, _, _ = self.feature_extractor.extract_patch_tokens(self.current_frame_image)
+        sim = tokens @ self.submap_last_keyframe_patch_tokens.T  # [N_cur, N_prev]
+        best_match_sim = sim.max(dim=1).values  # best match per current patch
+        novel_fraction = (best_match_sim < (1 - self.patch_novelty_threshold)).float().mean().item()
+        return novel_fraction > self.patch_novel_fraction_threshold
+
     def should_start_mapping(self, frame_id: int) -> bool:
         """ Determines whether mapping should be started based on the current frame ID.
         Args:
@@ -158,10 +177,25 @@ class Agent(object):
             # Search the submap's Faiss index for the most similar keyframe
             similarities, indices = self.submap_faiss_index.search(self.current_frame_feature, k=1)
             highest_similarity = similarities[0][0]
-            if 1 - highest_similarity > self.keyframing_threshold:
+            gap = 1 - highest_similarity
+            if gap > self.keyframing_threshold:
                 # Add the current frame feature to the submap index
                 self.submap_faiss_index.add(self.current_frame_feature)
+                if self.patch_level_check and self.current_frame_image is not None:            # NEW
+                    tokens, _, _ = self.feature_extractor.extract_patch_tokens(self.current_frame_image)  # NEW
+                    self.submap_last_keyframe_patch_tokens = tokens                              # NEW
                 return True
+            # NEW: only pay the patch-extraction cost in the borderline zone,
+            # where the global check almost, but not quite, said "novel".
+            if self.patch_level_check and gap > (self.keyframing_threshold * 0.5):              # NEW
+                if self._patch_level_novelty_check():                                            # NEW
+                    print(f"[keyframing-patch] agent{self.agent_id} frame {frame_id}: "           # NEW
+                          f"kich hoat bo sung (global gap={gap:.4f}, "                             # NEW
+                          f"nguong={self.keyframing_threshold})")                                  # NEW
+                    self.submap_faiss_index.add(self.current_frame_feature)                       # NEW
+                    tokens, _, _ = self.feature_extractor.extract_patch_tokens(self.current_frame_image)  # NEW
+                    self.submap_last_keyframe_patch_tokens = tokens                                # NEW
+                    return True                                                                    # NEW
             return False
 
     def save_current_submap_depth(self, frame_id: int, gaussian_model: GaussianModel, after_pgo: bool = False):
@@ -305,6 +339,7 @@ class Agent(object):
             # Prepare gaussian model for potential mapping
             gaussian_model.training_setup(self.opt)
             image = Image.fromarray(self.dataset[frame_id][1])
+            self.current_frame_image = image                  # NEW
             self.current_frame_feature = self.feature_extractor.extract_features(image)
             start_new_submap = self.should_start_new_submap(frame_id)
 
@@ -318,15 +353,22 @@ class Agent(object):
                 self.mapper.map(frame_id, estimated_c2w, gaussian_model, extensive_seeding, max_iterations)
 
                 image = Image.fromarray(self.dataset[frame_id][1])
+                self.current_frame_image = image               # NEW
                 self.current_keyframe_feature = self.feature_extractor.extract_features(image)
                 self.current_submap_feature = copy.deepcopy(self.current_keyframe_feature)
                 self.submap_features[self.submap_id] = self.feature_extractor.extract_features(image).cpu().numpy()
                 self.submap_faiss_index.add(self.current_keyframe_feature)
+                if self.patch_level_check:                                    # NEW
+                    tokens, _, _ = self.feature_extractor.extract_patch_tokens(image)  # NEW
+                    self.submap_last_keyframe_patch_tokens = tokens            # NEW
 
             elif self.should_start_mapping(frame_id):
                 self.keyframe_ids.append(frame_id)
                 extensive_seeding, max_iterations = False, self.mapper.iterations
                 self.mapper.map(frame_id, estimated_c2w, gaussian_model, extensive_seeding, max_iterations)
+
+        print(f"[summary] agent{self.agent_id}: {len(self.keyframe_ids)} keyframe(s), "
+              f"{self.submap_id + 1} submap(s)")
 
         if self.config["multi_gpu"]:  # Logging GPU usage makes sense only in multi-GPU mode
             # GPU:0 is used by the server

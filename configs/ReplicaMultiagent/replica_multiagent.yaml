@@ -66,6 +66,9 @@ submap:
 keyframing:
   active_keyframing: True
   keyframing_threshold: 0.02 # Alpha per paper
+  patch_level_check: false           # NEW -- off by default
+  patch_novelty_threshold: 0.15      # NEW -- per-patch cosine distance to count as "novel"
+  patch_novel_fraction_threshold: 0.10   # NEW -- fraction of novel patches needed to force a keyframe
 submapping:
   active_submapping: True
   submapping_threshold: 0.05
