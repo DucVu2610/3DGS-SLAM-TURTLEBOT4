@@ -1,4 +1,5 @@
 """ This module includes the Logger class, which is responsible for logging for both Mapper and the Tracker """
+import csv
 import pickle
 from io import BytesIO
 from pathlib import Path
@@ -12,7 +13,7 @@ from PIL import Image
 
 from src.utils.io_utils import get_gpu_usage_by_id, save_dict_to_json
 from src.utils.tracking_eval import align_trajectories, compute_ate, pose_error
-from src.utils.utils import find_submap, torch2np_decorator
+from src.utils.utils import find_submap, geodesic_rotation_error_deg, torch2np_decorator
 from src.utils.vis_utils import plot_trajectory
 
 
@@ -117,6 +118,95 @@ class Logger(object):
         (self.output_path).mkdir(exist_ok=True, parents=True)
         with open(self.output_path / artifact_name, "wb") as f:
             pickle.dump(loops, f)
+
+    def log_registration_metrics(self, agents_datasets: dict, loops: list,
+                                 fitness_threshold: float,
+                                 inlier_rmse_threshold: float,
+                                 rotation_threshold_deg: float = 5.0,
+                                 translation_threshold_cm: float = 10.0) -> None:
+        """Write paper-ready per-loop metrics and a compact JSON summary."""
+        rows = []
+        for loop in loops:
+            source_pose = np.asarray(
+                agents_datasets[loop.source_agent_id].poses[loop.source_frame_id])
+            target_pose = np.asarray(
+                agents_datasets[loop.target_agent_id].poses[loop.target_frame_id])
+            reference = np.linalg.inv(target_pose) @ source_pose
+            rotation_error = geodesic_rotation_error_deg(
+                loop.transformation[:3, :3], reference[:3, :3])
+            translation_error = float(np.linalg.norm(
+                loop.transformation[:3, 3] - reference[:3, 3]) * 100.0)
+            success = bool(rotation_error < rotation_threshold_deg and
+                           translation_error < translation_threshold_cm)
+            passed_filter = bool(loop.fitness > fitness_threshold and
+                                 loop.inlier_rmse < inlier_rmse_threshold)
+
+            rows.append({
+                "source_agent_id": loop.source_agent_id,
+                "source_frame_id": loop.source_frame_id,
+                "target_agent_id": loop.target_agent_id,
+                "target_frame_id": loop.target_frame_id,
+                "registration_method_requested": getattr(
+                    loop, "registration_method_requested", None),
+                "coarse_method_used": getattr(loop, "coarse_method_used", None),
+                "fallback_used": bool(getattr(loop, "fallback_used", False)),
+                "coarse_registration_failed": bool(getattr(
+                    loop, "coarse_registration_failed", False)),
+                "num_source_features": getattr(loop, "num_source_features", None),
+                "num_target_features": getattr(loop, "num_target_features", None),
+                "num_feature_matches": getattr(loop, "num_feature_matches", None),
+                "num_correspondences": getattr(loop, "num_correspondences", None),
+                "num_ransac_inliers": getattr(loop, "num_ransac_inliers", None),
+                "coarse_registration_time_s": getattr(
+                    loop, "coarse_registration_time", None),
+                "icp_registration_time_s": getattr(
+                    loop, "icp_registration_time", None),
+                "fitness": float(loop.fitness),
+                "inlier_rmse": float(loop.inlier_rmse),
+                "rotation_error_deg": float(rotation_error),
+                "translation_error_cm": translation_error,
+                "success": success,
+                "passed_filter": passed_filter,
+                "false_negative": success and not passed_filter,
+                "false_positive": passed_filter and not success,
+            })
+
+        csv_path = self.output_path / "registration_metrics.csv"
+        if rows:
+            with open(csv_path, "w", newline="") as output_file:
+                writer = csv.DictWriter(output_file, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+
+        def mean_of(field):
+            values = [row[field] for row in rows if row[field] is not None]
+            return float(np.mean(values)) if values else None
+
+        successful = sum(row["success"] for row in rows)
+        summary = {
+            "num_inter_agent_loops": len(rows),
+            "num_successful": successful,
+            "success_rate_percent": 100.0 * successful / len(rows) if rows else 0.0,
+            "mean_rotation_error_deg": mean_of("rotation_error_deg"),
+            "mean_translation_error_cm": mean_of("translation_error_cm"),
+            "mean_fitness": mean_of("fitness"),
+            "mean_inlier_rmse": mean_of("inlier_rmse"),
+            "mean_feature_matches": mean_of("num_feature_matches"),
+            "mean_depth_valid_correspondences": mean_of("num_correspondences"),
+            "mean_ransac_inliers": mean_of("num_ransac_inliers"),
+            "mean_coarse_registration_time_s": mean_of("coarse_registration_time_s"),
+            "mean_icp_registration_time_s": mean_of("icp_registration_time_s"),
+            "num_passed_filter": sum(row["passed_filter"] for row in rows),
+            "num_coarse_failures": sum(row["coarse_registration_failed"] for row in rows),
+            "num_fpfh_fallbacks": sum(row["fallback_used"] for row in rows),
+            "num_false_negatives": sum(row["false_negative"] for row in rows),
+            "num_false_positives": sum(row["false_positive"] for row in rows),
+            "rotation_success_threshold_deg": rotation_threshold_deg,
+            "translation_success_threshold_cm": translation_threshold_cm,
+            "fitness_threshold": fitness_threshold,
+            "inlier_rmse_threshold": inlier_rmse_threshold,
+        }
+        save_dict_to_json(summary, "registration_summary.json", directory=self.output_path)
 
     def log_loops_quality(self, agents_submaps: dict, agents_datasets: dict, loops: list):
         output_file = open(str(self.output_path / "loops_quality.txt"), "w")

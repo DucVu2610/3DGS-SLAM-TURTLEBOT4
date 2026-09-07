@@ -108,10 +108,13 @@ class MAGiCSLAM(object):
         elif self.config["submap"]["anchor_data"] == "depth" or self.config["submap"]["anchor_data"] =="render_depth":
             init_unknown = self.config["submap"]["initial_transformation_unknown"]
             reg_method = self.config["submap"].get("registration_method", "fpfh")
+            fallback_to_fpfh = self.config["submap"].get("fallback_to_fpfh", True)
             registration_fn = lambda s, r: register_submaps_depth(
                 s, r, init_unknown,
                 registration_method=reg_method,
-                feature_extractor=loop_detector._feature_extractor if reg_method == "dinov2" else None)
+                feature_extractor=loop_detector._feature_extractor if reg_method == "dinov2" else None,
+                fallback_to_fpfh=fallback_to_fpfh,
+                registration_options=self.config["submap"].get("registration_options", {}))
             intra_loops = register_agents_submaps_depth(
                 agents_submaps, intra_loops, registration_fn, max_threads=1)
             inter_loops = register_agents_submaps_depth(
@@ -120,6 +123,14 @@ class MAGiCSLAM(object):
             raise ValueError(f"Unknown anchor data type: {self.config['submap']['anchor_data']}")
 
         self.logger.log_loops(intra_loops + inter_loops, "loops.pkl")
+        agents_datasets = {
+            agent_id: self.agents[agent_id].dataset for agent_id in self.agent_ids
+        }
+        self.logger.log_registration_metrics(
+            agents_datasets,
+            inter_loops,
+            loop_detector.fitness_threshold,
+            loop_detector.inlier_rmse_threshold)
 
         intra_loops = loop_detector.filter_loops(intra_loops)
         inter_loops = loop_detector.filter_loops(inter_loops)

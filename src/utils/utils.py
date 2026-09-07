@@ -39,6 +39,8 @@ def setup_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
+    if hasattr(o3d.utility, "random"):
+        o3d.utility.random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -414,10 +416,115 @@ def patch_idx_to_pixel(patch_idx, grid_w, patch_h_px, patch_w_px):
     row, col = patch_idx // grid_w, patch_idx % grid_w
     return int((col + 0.5) * patch_w_px), int((row + 0.5) * patch_h_px)
 
+
+def _ransac_from_correspondences(src_pts, tgt_pts, distance_threshold):
+    """Estimate a rigid transform from paired 3D points and report inliers."""
+    src_pcd = o3d.geometry.PointCloud(
+        o3d.utility.Vector3dVector(np.asarray(src_pts, dtype=np.float64)))
+    tgt_pcd = o3d.geometry.PointCloud(
+        o3d.utility.Vector3dVector(np.asarray(tgt_pts, dtype=np.float64)))
+    corres = o3d.utility.Vector2iVector(
+        np.column_stack((np.arange(len(src_pts)), np.arange(len(src_pts)))).astype(np.int32))
+    result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
+        src_pcd, tgt_pcd, corres, distance_threshold,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        ransac_n=3,
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 1000))
+    return result.transformation, len(result.correspondence_set)
+
+
+def _valid_depth_point(u, v, depth, intrinsics):
+    """Return the back-projected point at a feature location, or None."""
+    u, v = int(round(u)), int(round(v))
+    if v < 0 or u < 0 or v >= depth.shape[0] or u >= depth.shape[1]:
+        return None
+    value = float(depth[v, u])
+    if not np.isfinite(value) or value <= 0:
+        return None
+    return unproject(u, v, value, intrinsics)
+
+
+def _create_local_feature_detector(method, max_keypoints):
+    """Create an OpenCV local feature detector and its descriptor norm."""
+    method = method.lower()
+    if method == "sift":
+        if not hasattr(cv2, "SIFT_create"):
+            raise RuntimeError("This OpenCV build does not provide SIFT_create().")
+        return cv2.SIFT_create(nfeatures=max_keypoints), cv2.NORM_L2
+    if method == "orb":
+        return cv2.ORB_create(nfeatures=max_keypoints), cv2.NORM_HAMMING
+    if method == "akaze":
+        return cv2.AKAZE_create(), cv2.NORM_HAMMING
+    raise ValueError(f"Unsupported local feature registration method: {method}")
+
+
+def coarse_registration_local_features(source_color, source_depth, target_color, target_depth,
+                                       source_intrinsics, target_intrinsics, method,
+                                       distance_threshold=0.05, min_correspondences=8,
+                                       max_keypoints=4096, ratio_threshold=0.8):
+    """Sparse image features -> mutual ratio-test matches -> 3D RANSAC.
+
+    Supported methods are SIFT, ORB, and AKAZE. The returned diagnostics use
+    the same field names as the DINOv2 path so experiment results can be
+    compared without method-specific parsing.
+    """
+    detector, norm_type = _create_local_feature_detector(method, max_keypoints)
+    source_gray = cv2.cvtColor(source_color, cv2.COLOR_RGB2GRAY)
+    target_gray = cv2.cvtColor(target_color, cv2.COLOR_RGB2GRAY)
+    src_kp, src_desc = detector.detectAndCompute(source_gray, None)
+    tgt_kp, tgt_desc = detector.detectAndCompute(target_gray, None)
+
+    diagnostics = {
+        "num_source_features": len(src_kp),
+        "num_target_features": len(tgt_kp),
+        "num_feature_matches": 0,
+        "num_correspondences": 0,
+        "num_ransac_inliers": 0,
+    }
+    if src_desc is None or tgt_desc is None or len(src_desc) < 2 or len(tgt_desc) < 2:
+        return None, diagnostics
+
+    matcher = cv2.BFMatcher(norm_type)
+
+    def ratio_matches(query_desc, train_desc):
+        accepted = {}
+        for pair in matcher.knnMatch(query_desc, train_desc, k=2):
+            if len(pair) == 2 and pair[0].distance < ratio_threshold * pair[1].distance:
+                accepted[pair[0].queryIdx] = pair[0].trainIdx
+        return accepted
+
+    source_to_target = ratio_matches(src_desc, tgt_desc)
+    target_to_source = ratio_matches(tgt_desc, src_desc)
+    matches = [(source_idx, target_idx)
+               for source_idx, target_idx in source_to_target.items()
+               if target_to_source.get(target_idx) == source_idx]
+    diagnostics["num_feature_matches"] = len(matches)
+
+    src_pts, tgt_pts = [], []
+    for source_idx, target_idx in matches:
+        source_xy = src_kp[source_idx].pt
+        target_xy = tgt_kp[target_idx].pt
+        source_point = _valid_depth_point(*source_xy, source_depth, source_intrinsics)
+        target_point = _valid_depth_point(*target_xy, target_depth, target_intrinsics)
+        if source_point is None or target_point is None:
+            continue
+        src_pts.append(source_point)
+        tgt_pts.append(target_point)
+
+    diagnostics["num_correspondences"] = len(src_pts)
+    if len(src_pts) < min_correspondences:
+        return None, diagnostics
+
+    transform, num_inliers = _ransac_from_correspondences(
+        src_pts, tgt_pts, distance_threshold)
+    diagnostics["num_ransac_inliers"] = num_inliers
+    return transform, diagnostics
+
+
 def coarse_registration_dinov2(source_color, source_depth, target_color, target_depth,
                                 source_intrinsics, target_intrinsics,
                                 feature_extractor, distance_threshold=0.05,
-                                min_correspondences=8):
+                                min_correspondences=8, return_diagnostics=False):
     """ DINOv2 patch mutual-NN correspondences -> 3D lift via depth -> RANSAC
         (Umeyama/Kabsch on known correspondences).
     Returns:
@@ -428,38 +535,43 @@ def coarse_registration_dinov2(source_color, source_depth, target_color, target_
     src_tok, (gh, gw), (ph, pw) = feature_extractor.extract_patch_tokens(Image.fromarray(source_color))
     tgt_tok, _, _ = feature_extractor.extract_patch_tokens(Image.fromarray(target_color))
 
+    diagnostics = {
+        "num_source_features": int(src_tok.shape[0]),
+        "num_target_features": int(tgt_tok.shape[0]),
+        "num_feature_matches": 0,
+        "num_correspondences": 0,
+        "num_ransac_inliers": 0,
+    }
+
     sim = src_tok @ tgt_tok.T
     s2t = sim.argmax(dim=1)
     t2s = sim.argmax(dim=0)
     mutual = t2s[s2t] == torch.arange(s2t.shape[0], device=sim.device)
     matched_src = torch.nonzero(mutual).squeeze(1)
+    diagnostics["num_feature_matches"] = int(matched_src.numel())
     if matched_src.numel() < min_correspondences:
-        return None, int(matched_src.numel())
+        return (None, diagnostics) if return_diagnostics else (None, int(matched_src.numel()))
     matched_tgt = s2t[matched_src]
 
     src_pts, tgt_pts = [], []
     for si, ti in zip(matched_src.tolist(), matched_tgt.tolist()):
         u_s, v_s = patch_idx_to_pixel(si, gw, ph, pw)
         u_t, v_t = patch_idx_to_pixel(ti, gw, ph, pw)
-        if v_s >= source_depth.shape[0] or u_s >= source_depth.shape[1]: continue
-        if v_t >= target_depth.shape[0] or u_t >= target_depth.shape[1]: continue
-        d_s, d_t = source_depth[v_s, u_s], target_depth[v_t, u_t]
-        if d_s <= 0 or d_t <= 0: continue
-        src_pts.append(unproject(u_s, v_s, d_s, source_intrinsics))
-        tgt_pts.append(unproject(u_t, v_t, d_t, target_intrinsics))
+        source_point = _valid_depth_point(u_s, v_s, source_depth, source_intrinsics)
+        target_point = _valid_depth_point(u_t, v_t, target_depth, target_intrinsics)
+        if source_point is None or target_point is None:
+            continue
+        src_pts.append(source_point)
+        tgt_pts.append(target_point)
 
+    diagnostics["num_correspondences"] = len(src_pts)
     if len(src_pts) < min_correspondences:
-        return None, len(src_pts)
+        return (None, diagnostics) if return_diagnostics else (None, len(src_pts))
 
-    src_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(src_pts)))
-    tgt_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(tgt_pts)))
-    corres = o3d.utility.Vector2iVector(np.array([[i, i] for i in range(len(src_pts))]))
-    result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
-        src_pcd, tgt_pcd, corres, distance_threshold,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-        ransac_n=3,
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 1000))
-    return result.transformation, len(src_pts)
+    transform, num_inliers = _ransac_from_correspondences(
+        src_pts, tgt_pts, distance_threshold)
+    diagnostics["num_ransac_inliers"] = num_inliers
+    return (transform, diagnostics) if return_diagnostics else (transform, len(src_pts))
 
 def geodesic_rotation_error_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
     """ Sign-ambiguity-free rotation error in degrees between two 3x3

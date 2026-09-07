@@ -32,8 +32,17 @@ class Registration(object):
         self.transformation = np.eye(4)
         self.inlier_rmse = 100.0
         self.fitness = 0.0
-        self.coarse_method_used = None      # "dinov2" or "fpfh", set in register_submaps_depth
-        self.num_correspondences = None     # only meaningful when a dinov2 attempt was made
+        self.registration_method_requested = None
+        self.coarse_method_used = None
+        self.fallback_used = False
+        self.coarse_registration_failed = False
+        self.num_source_features = None
+        self.num_target_features = None
+        self.num_feature_matches = None
+        self.num_correspondences = None
+        self.num_ransac_inliers = None
+        self.coarse_registration_time = None
+        self.icp_registration_time = None
 
 
 def refine_map(gaussian_model, agents_datasets: dict, agents_keyframe_ids: dict, agents_c2ws: dict, iterations=3000):
@@ -201,7 +210,9 @@ def register_agents_submaps(agents_submaps: dict, registrations: list,
 def register_submaps_depth(agents_submaps: dict, registration: Registration,
                            initial_transformation_unknown: bool = True,
                            registration_method: str = "fpfh",
-                           feature_extractor=None):
+                           feature_extractor=None,
+                           fallback_to_fpfh: bool = True,
+                           registration_options: dict = None):
     """ Register two submaps using ICP.
     Args:
         agents_submaps: A dictionary of agent submaps.
@@ -209,9 +220,13 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
         initial_transformation_unknown: If True, use a coarse registration as the
             initial guess for inter-agent loops. If False, the odometry-based init_transformation
             set by detect_loops() is used directly (assumes a known relative pose between agents).
-        registration_method: "fpfh" (default) or "dinov2" for the coarse registration used
-            when initial_transformation_unknown is True.
+        registration_method: "fpfh", "dinov2", "sift", "orb", or "akaze"
+            for the coarse registration used when initial_transformation_unknown is True.
         feature_extractor: DINOv2 feature extractor, required when registration_method="dinov2".
+        fallback_to_fpfh: If True, use FPFH when a visual method produces too
+            few valid correspondences. Disable this for pure extractor benchmarks.
+        registration_options: Shared RANSAC/correspondence settings plus sparse
+            local-feature settings. Defaults preserve the original DINOv2 path.
     Returns:
         registration: The registration object with the transformation and fitness updated.
     """
@@ -224,31 +239,78 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
     source_cloud = utils.rgbd2ptcloud(source_color, source_depth, source_submap["intrinsics"], np.eye(4))
     target_cloud = utils.rgbd2ptcloud(target_color, target_depth, target_submap["intrinsics"], np.eye(4))
 
+    supported_methods = {"fpfh", "dinov2", "sift", "orb", "akaze"}
+    registration_method = registration_method.lower()
+    if registration_method not in supported_methods:
+        raise ValueError(
+            f"Unknown registration_method={registration_method!r}; "
+            f"expected one of {sorted(supported_methods)}")
+    registration.registration_method_requested = registration_method
+    registration_options = registration_options or {}
+    min_correspondences = registration_options.get("min_correspondences", 8)
+    ransac_distance_threshold = registration_options.get(
+        "ransac_distance_threshold", 0.05)
+
     if source_submap['agent_id'] != target_submap['agent_id'] and initial_transformation_unknown:
+        coarse_start = time.perf_counter()
         transform = None
+        diagnostics = {}
         if registration_method == "dinov2":
-            transform, n_corr = utils.coarse_registration_dinov2(
+            if feature_extractor is None or not hasattr(feature_extractor, "extract_patch_tokens"):
+                raise ValueError("DINOv2 registration requires an extractor with extract_patch_tokens().")
+            transform, diagnostics = utils.coarse_registration_dinov2(
                 source_color, source_depth, target_color, target_depth,
-                source_submap["intrinsics"], target_submap["intrinsics"], feature_extractor)
-            registration.num_correspondences = n_corr
-            print(f"[registration] dinov2 attempt: {n_corr} correspondences "
+                source_submap["intrinsics"], target_submap["intrinsics"], feature_extractor,
+                distance_threshold=ransac_distance_threshold,
+                min_correspondences=min_correspondences,
+                return_diagnostics=True)
+        elif registration_method in {"sift", "orb", "akaze"}:
+            transform, diagnostics = utils.coarse_registration_local_features(
+                source_color, source_depth, target_color, target_depth,
+                source_submap["intrinsics"], target_submap["intrinsics"],
+                method=registration_method,
+                distance_threshold=ransac_distance_threshold,
+                min_correspondences=min_correspondences,
+                max_keypoints=registration_options.get("max_keypoints", 4096),
+                ratio_threshold=registration_options.get("ratio_threshold", 0.8))
+
+        for field, value in diagnostics.items():
+            setattr(registration, field, value)
+        min_ransac_inliers = registration_options.get("min_ransac_inliers", 3)
+        if (transform is not None and diagnostics and
+                diagnostics["num_ransac_inliers"] < min_ransac_inliers):
+            transform = None
+        if diagnostics:
+            print(f"[registration] {registration_method} attempt: "
+                  f"{diagnostics['num_feature_matches']} feature matches, "
+                  f"{diagnostics['num_correspondences']} depth-valid correspondences, "
+                  f"{diagnostics['num_ransac_inliers']} RANSAC inliers "
                   f"(agent {source_submap['agent_id']} <-> {target_submap['agent_id']})")
         if transform is None:
-            transform = utils.coarse_registration(source_cloud, target_cloud)
-            registration.coarse_method_used = "fpfh"
+            if registration_method == "fpfh" or fallback_to_fpfh:
+                transform = utils.coarse_registration(source_cloud, target_cloud)
+                registration.coarse_method_used = "fpfh"
+                registration.fallback_used = registration_method != "fpfh"
+            else:
+                registration.coarse_registration_failed = True
+                registration.coarse_registration_time = time.perf_counter() - coarse_start
+                return registration
         else:
-            registration.coarse_method_used = "dinov2"
+            registration.coarse_method_used = registration_method
+        registration.coarse_registration_time = time.perf_counter() - coarse_start
         registration.init_transformation = transform
 
     source_cloud.estimate_normals()
     target_cloud.estimate_normals()
 
     distance_threshold = 0.005
+    icp_start = time.perf_counter()
     fine_alignment = o3d.pipelines.registration.registration_icp(
         source_cloud, target_cloud, distance_threshold, registration.init_transformation,
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
         o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=500,
                                                           relative_fitness=1e-9, relative_rmse=1e-9))
+    registration.icp_registration_time = time.perf_counter() - icp_start
 
     # draw_registration_result(source_cloud, target_cloud, fine_alignment.transformation)
 

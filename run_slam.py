@@ -17,6 +17,10 @@ def get_args():
     parser.add_argument('--wandb_entity', type=str)
     parser.add_argument('--experiment_name', type=str)
     parser.add_argument('--group_name', type=str)
+    parser.add_argument(
+        '--registration_method',
+        choices=['fpfh', 'dinov2', 'sift', 'orb', 'akaze'],
+        help='Override submap.registration_method for a comparable experiment run')
     return parser.parse_args()
 
 
@@ -39,6 +43,8 @@ def update_config_with_args(config, args):
         config["experiment_name"] = args.experiment_name
     if args.group_name:
         config["group_name"] = args.group_name
+    if args.registration_method:
+        config["submap"]["registration_method"] = args.registration_method
     return config
 
 
