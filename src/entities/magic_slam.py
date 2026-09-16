@@ -11,6 +11,7 @@ import wandb
 from src.entities.agent import Agent
 from src.entities.datasets import get_dataset
 from src.entities.logger import Logger
+from src.entities.loop_detection.feature_extractors import get_patch_feature_extractor
 from src.entities.loop_detection.loop_detector import LoopDetector
 from src.entities.pose_graph_adapter import PoseGraphAdapter
 from src.entities.gtsam_pose_graph import PoseGraphAdapter_gtsam
@@ -97,8 +98,20 @@ class MAGiCSLAM(object):
             agents_c2ws[agent_id] = np.vstack([submap["submap_c2ws"] for submap in agent_submaps])
 
         intra_loops, inter_loops = loop_detector.detect_loops(agents_submaps)
+        num_detected_intra_loops = len(intra_loops)
+        num_detected_inter_loops = len(inter_loops)
+        # Preserve the candidates from this run before registration mutates the
+        # Registration objects.  This makes it explicit that the production
+        # path does not consume a cached loops.pkl from an earlier benchmark.
+        self.logger.log_loops(
+            intra_loops + inter_loops, "detected_loops.pkl")
         vis_utils.plot_agents_pose_graph(agents_c2ws, {}, intra_loops, inter_loops,
                                          output_path=str(self.output_path / "all_loops.png"))
+
+        reg_method = self.config["submap"].get(
+            "registration_method", "fpfh").lower()
+        fallback_to_fpfh = self.config["submap"].get(
+            "fallback_to_fpfh", True)
 
         if self.config["submap"]["anchor_data"] == "pcd":
             intra_loops = register_agents_submaps(
@@ -107,15 +120,16 @@ class MAGiCSLAM(object):
                 agents_submaps, inter_loops, register_submaps, max_threads=20)
         elif self.config["submap"]["anchor_data"] in {"depth", "render_depth"}:
             init_unknown = self.config["submap"]["initial_transformation_unknown"]
-            reg_method = self.config["submap"].get("registration_method", "fpfh")
-            fallback_to_fpfh = self.config["submap"].get("fallback_to_fpfh", True)
-            semantic_registration = {"dinov2", "gaussian_landmark"}
+            registration_extractor = None
+            if reg_method in {"dinov2", "gaussian_landmark"}:
+                registration_extractor = get_patch_feature_extractor(
+                    self.config["loop_detection"],
+                    self.config["submap"],
+                    loop_detector._feature_extractor)
             registration_fn = lambda s, r: register_submaps_depth(
                 s, r, init_unknown,
                 registration_method=reg_method,
-                feature_extractor=(
-                    loop_detector._feature_extractor
-                    if reg_method in semantic_registration else None),
+                feature_extractor=registration_extractor,
                 fallback_to_fpfh=fallback_to_fpfh,
                 registration_options=self.config["submap"].get("registration_options", {}))
             intra_loops = register_agents_submaps_depth(
@@ -140,6 +154,14 @@ class MAGiCSLAM(object):
         print(f"Filtered intra loops: {len(intra_loops)}")
         print(f"Filtered inter loops: {len(inter_loops)}")
         self.logger.log_loops(intra_loops + inter_loops, "filtered_loops.pkl")
+        save_dict_to_json({
+            "registration_method": reg_method,
+            "fallback_to_fpfh": bool(fallback_to_fpfh),
+            "num_detected_intra_loops": num_detected_intra_loops,
+            "num_detected_inter_loops": num_detected_inter_loops,
+            "num_filtered_intra_loops": len(intra_loops),
+            "num_filtered_inter_loops": len(inter_loops),
+        }, "loop_pipeline_summary.json", directory=self.output_path)
 
         if self.config["submap"]["PGO_GTSAM"]:
             # Our method uses the PoseGraphAdapter_gtsam to optimize the poses with information matrix

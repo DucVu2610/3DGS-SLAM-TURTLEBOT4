@@ -178,3 +178,41 @@ def get_feature_extractor(config: dict) -> BaseFeatureExtractor:
         return NetVLADFeatureExtractor(config)
     else:
         raise NotImplementedError
+
+
+def get_patch_feature_extractor(
+        loop_detection_config: dict,
+        registration_config: dict = None,
+        existing_extractor=None) -> DINOFeatureExtractor:
+    """Return the DINO patch extractor used by semantic registration.
+
+    Loop retrieval and pairwise registration usually share one DINO model.  If
+    loop retrieval uses another descriptor (for example NetVLAD), or the user
+    requests another device/weight path for registration, create a dedicated
+    DINO extractor instead.  This keeps Gaussian-landmark registration usable
+    in the full SLAM pipeline without coupling it to the retrieval backend.
+    """
+    registration_config = registration_config or {}
+    extractor_config = dict(loop_detection_config)
+    extractor_config["feature_extractor_name"] = "dino"
+    extractor_config["weights_path"] = registration_config.get(
+        "registration_weights_path", extractor_config.get("weights_path"))
+    extractor_config["device"] = registration_config.get(
+        "registration_device", extractor_config.get("device", "cpu"))
+
+    if not extractor_config.get("weights_path"):
+        raise ValueError(
+            "Semantic registration requires submap.registration_weights_path "
+            "or loop_detection.weights_path.")
+
+    can_reuse = (
+        existing_extractor is not None
+        and hasattr(existing_extractor, "extract_patch_tokens")
+        and getattr(existing_extractor, "weights_path", None)
+        == extractor_config["weights_path"]
+        and getattr(existing_extractor, "device", None)
+        == extractor_config["device"]
+    )
+    if can_reuse:
+        return existing_extractor
+    return DINOFeatureExtractor(extractor_config)

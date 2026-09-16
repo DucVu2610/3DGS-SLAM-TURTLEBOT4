@@ -62,7 +62,10 @@ submap:
   anchor_data: render_depth #pcd, depth, render_depth
   initial_transformation_unknown: True
   PGO_GTSAM: True
-  registration_method: fpfh   # fpfh | dinov2 | gaussian_landmark | sift | orb | akaze
+  # Full SLAM now registers newly detected inter-agent loops against the
+  # target submap's optimized Gaussian centres.  Use --registration_method
+  # fpfh/dinov2 to reproduce the earlier baselines.
+  registration_method: gaussian_landmark
   fallback_to_fpfh: true
   registration_options:
     min_correspondences: 8
