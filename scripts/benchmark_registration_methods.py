@@ -29,7 +29,38 @@ from src.utils.magic_slam_utils import Registration, register_submaps_depth
 from src.utils.utils import setup_seed
 
 
-SUPPORTED_METHODS = ("fpfh", "dinov2", "sift", "orb", "akaze")
+SUPPORTED_METHODS = (
+    "fpfh", "dinov2", "dinov2_corr", "gaussian_landmark",
+    "sift", "orb", "akaze",
+)
+
+DINO_BASELINE_OPTIONS = {
+    "dino_min_similarity": -1.0,
+    "dino_min_margin": -1.0,
+    "dino_keep_top_fraction": 1.0,
+    "dino_depth_window_radius": 0,
+    "dino_depth_max_mad_m": None,
+    "dino_compatibility_threshold_m": 0.0,
+    "dino_min_compatibility_support": 0,
+}
+
+DINO_CORR_DEFAULTS = {
+    "dino_min_similarity": 0.55,
+    "dino_min_margin": 0.01,
+    "dino_keep_top_fraction": 0.75,
+    "dino_depth_window_radius": 2,
+    "dino_depth_max_mad_m": 0.05,
+    "dino_compatibility_threshold_m": 0.05,
+    "dino_min_compatibility_support": 8,
+}
+
+GAUSSIAN_LANDMARK_DEFAULTS = {
+    **DINO_BASELINE_OPTIONS,
+    "gaussian_min_opacity": 0.05,
+    "gaussian_depth_tolerance_m": 0.05,
+    "gaussian_max_landmarks": 2048,
+    "gaussian_refit_inliers": True,
+}
 
 
 def parse_args():
@@ -46,6 +77,19 @@ def parse_args():
                         help="Enable production fallback; leave off for pure extractor comparison")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0],
                         help="RANSAC seeds; use several values for paper statistics")
+    parser.add_argument("--dino-min-similarity", type=float)
+    parser.add_argument("--dino-min-margin", type=float)
+    parser.add_argument("--dino-keep-top-fraction", type=float)
+    parser.add_argument("--dino-depth-window-radius", type=int)
+    parser.add_argument("--dino-depth-max-mad-m", type=float)
+    parser.add_argument("--dino-compatibility-threshold-m", type=float)
+    parser.add_argument("--dino-min-compatibility-support", type=int)
+    parser.add_argument("--gaussian-min-opacity", type=float)
+    parser.add_argument("--gaussian-depth-tolerance-m", type=float)
+    parser.add_argument("--gaussian-max-landmarks", type=int)
+    parser.add_argument(
+        "--no-gaussian-refit-inliers", action="store_true",
+        help="Keep the raw three-point RANSAC model for the Gaussian variant")
     return parser.parse_args()
 
 
@@ -103,11 +147,23 @@ def fresh_registration(loop):
 
 
 def run_method(method, config, agents_submaps, candidate_loops, datasets,
-               output_dir, feature_extractor, allow_fpfh_fallback, seed):
+               output_dir, feature_extractor, allow_fpfh_fallback, seed,
+               dino_corr_overrides=None):
     setup_seed(seed)
     method_dir = output_dir / method / f"seed_{seed}"
     method_dir.mkdir(parents=True, exist_ok=True)
     logger = Logger(method_dir)
+
+    base_method = "dinov2" if method in {"dinov2", "dinov2_corr"} else method
+    registration_options = dict(config["submap"].get("registration_options", {}))
+    if method == "dinov2":
+        registration_options.update(DINO_BASELINE_OPTIONS)
+    elif method == "dinov2_corr":
+        registration_options.update(DINO_CORR_DEFAULTS)
+        registration_options.update(dino_corr_overrides or {})
+    elif method == "gaussian_landmark":
+        registration_options.update(GAUSSIAN_LANDMARK_DEFAULTS)
+        registration_options.update(dino_corr_overrides or {})
 
     start = time.perf_counter()
     registrations = []
@@ -117,10 +173,11 @@ def run_method(method, config, agents_submaps, candidate_loops, datasets,
             agents_submaps,
             registration,
             initial_transformation_unknown=True,
-            registration_method=method,
-            feature_extractor=feature_extractor if method == "dinov2" else None,
+            registration_method=base_method,
+            feature_extractor=(feature_extractor if base_method in {
+                "dinov2", "gaussian_landmark"} else None),
             fallback_to_fpfh=allow_fpfh_fallback,
-            registration_options=config["submap"].get("registration_options", {}))
+            registration_options=registration_options)
         registrations.append(registration)
     wall_time = time.perf_counter() - start
 
@@ -139,10 +196,17 @@ def run_method(method, config, agents_submaps, candidate_loops, datasets,
         summary = json.load(input_file)
     summary.update({
         "method": method,
+        "registration_method_base": base_method,
         "benchmark_wall_time_s": wall_time,
         "allow_fpfh_fallback": allow_fpfh_fallback,
         "seed": seed,
     })
+    if base_method in {"dinov2", "gaussian_landmark"}:
+        option_names = set(DINO_BASELINE_OPTIONS)
+        if base_method == "gaussian_landmark":
+            option_names.update(GAUSSIAN_LANDMARK_DEFAULTS)
+        summary.update({key: registration_options.get(key)
+                        for key in sorted(option_names)})
     with open(summary_path, "w") as output_file:
         json.dump(summary, output_file, indent=2)
     return summary
@@ -152,8 +216,10 @@ def write_comparison(output_dir, summaries):
     with open(output_dir / "comparison.json", "w") as output_file:
         json.dump(summaries, output_file, indent=2)
     if summaries:
+        fieldnames = list(dict.fromkeys(
+            key for summary in summaries for key in summary.keys()))
         with open(output_dir / "comparison.csv", "w", newline="") as output_file:
-            writer = csv.DictWriter(output_file, fieldnames=list(summaries[0].keys()))
+            writer = csv.DictWriter(output_file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(summaries)
 
@@ -163,8 +229,28 @@ def write_comparison(output_dir, summaries):
         "mean_translation_error_cm",
         "mean_fitness",
         "mean_feature_matches",
+        "mean_mutual_matches",
+        "mean_confidence_matches",
         "mean_depth_valid_correspondences",
+        "mean_geometry_consistent_correspondences",
+        "mean_final_correspondences",
         "mean_ransac_inliers",
+        "mean_ransac_inlier_ratio",
+        "mean_correspondence_retention_ratio",
+        "mean_match_similarity",
+        "mean_match_margin",
+        "mean_compatibility_support",
+        "mean_gaussians_total",
+        "mean_gaussians_opacity_valid",
+        "mean_gaussians_in_view",
+        "mean_gaussians_depth_consistent",
+        "mean_gaussian_landmarks",
+        "mean_gaussian_landmark_opacity",
+        "mean_gaussian_depth_residual_m",
+        "mean_coarse_rotation_error_deg",
+        "mean_coarse_translation_error_cm",
+        "mean_icp_rotation_improvement_deg",
+        "mean_icp_translation_improvement_cm",
         "mean_coarse_registration_time_s",
         "mean_icp_registration_time_s",
         "num_passed_filter",
@@ -202,21 +288,51 @@ def main():
     datasets = load_datasets(config)
 
     feature_extractor = None
-    if "dinov2" in args.methods:
+    if any(method in {
+            "dinov2", "dinov2_corr", "gaussian_landmark"
+            } for method in args.methods):
         extractor_config = dict(config["loop_detection"])
         extractor_config["feature_extractor_name"] = "dino"
         if args.dinov2_weights:
             extractor_config["weights_path"] = args.dinov2_weights
         feature_extractor = get_feature_extractor(extractor_config)
 
+    dino_corr_overrides = {}
+    for argument_name, option_name in (
+            ("dino_min_similarity", "dino_min_similarity"),
+            ("dino_min_margin", "dino_min_margin"),
+            ("dino_keep_top_fraction", "dino_keep_top_fraction"),
+            ("dino_depth_window_radius", "dino_depth_window_radius"),
+            ("dino_depth_max_mad_m", "dino_depth_max_mad_m"),
+            ("dino_compatibility_threshold_m", "dino_compatibility_threshold_m"),
+            ("dino_min_compatibility_support", "dino_min_compatibility_support")):
+        value = getattr(args, argument_name)
+        if value is not None:
+            dino_corr_overrides[option_name] = value
+
+    gaussian_overrides = {
+        "gaussian_refit_inliers": not args.no_gaussian_refit_inliers,
+    }
+    for argument_name, option_name in (
+            ("gaussian_min_opacity", "gaussian_min_opacity"),
+            ("gaussian_depth_tolerance_m", "gaussian_depth_tolerance_m"),
+            ("gaussian_max_landmarks", "gaussian_max_landmarks")):
+        value = getattr(args, argument_name)
+        if value is not None:
+            gaussian_overrides[option_name] = value
+
     summaries = []
     for method in args.methods:
         for seed in args.seeds:
             print(f"\n=== Benchmarking {method}, seed={seed}, "
                   f"{len(candidate_loops)} inter-agent loop(s) ===")
+            method_overrides = dict(dino_corr_overrides)
+            if method == "gaussian_landmark":
+                method_overrides.update(gaussian_overrides)
             summaries.append(run_method(
                 method, config, agents_submaps, candidate_loops, datasets,
-                output_dir, feature_extractor, args.allow_fpfh_fallback, seed))
+                output_dir, feature_extractor, args.allow_fpfh_fallback, seed,
+                dino_corr_overrides=method_overrides))
     write_comparison(output_dir, summaries)
     print(f"\nComparison written to {output_dir / 'comparison.csv'}")
 

@@ -159,16 +159,22 @@ class TUM_RGBD(torch.utils.data.Dataset):
         self.depth_paths = []
         self.poses = []
         self.color_transform = torchvision.transforms.ToTensor()
-        normalize_poses = dataset_config.get("initial_transformation_unknown", True)
+        # Inter-agent registration and pose normalisation are independent.
+        # Pseudo-agent TUM splits must retain their common ground-truth frame
+        # even though their initial relative transform is treated as unknown.
+        normalize_poses = dataset_config.get(
+            "normalize_poses",
+            dataset_config.get("initial_transformation_unknown", True))
         self.color_paths, self.depth_paths, self.poses = self.loadtum(
             self.dataset_path, frame_rate=32, normalize_poses=normalize_poses)
         
     def __len__(self):
-        return len(self.color_paths) if self.frame_limit < 0 else int(self.frame_limit)
+        return (len(self.color_paths) if self.frame_limit < 0
+                else min(int(self.frame_limit), len(self.color_paths)))
 
     def parse_list(self, filepath, skiprows=0):
         """ read list data """
-        return np.loadtxt(filepath, delimiter=' ', dtype=np.unicode_, skiprows=skiprows)
+        return np.loadtxt(filepath, delimiter=' ', dtype=str, skiprows=skiprows)
 
     def associate_frames(self, tstamp_image, tstamp_depth, tstamp_pose, max_dt=0.08):
         """ pair images, depths, and poses """

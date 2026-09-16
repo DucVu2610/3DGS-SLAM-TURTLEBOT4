@@ -105,14 +105,17 @@ class MAGiCSLAM(object):
                 agents_submaps, intra_loops, register_submaps, max_threads=20)
             inter_loops = register_agents_submaps(
                 agents_submaps, inter_loops, register_submaps, max_threads=20)
-        elif self.config["submap"]["anchor_data"] == "depth" or self.config["submap"]["anchor_data"] =="render_depth":
+        elif self.config["submap"]["anchor_data"] in {"depth", "render_depth"}:
             init_unknown = self.config["submap"]["initial_transformation_unknown"]
             reg_method = self.config["submap"].get("registration_method", "fpfh")
             fallback_to_fpfh = self.config["submap"].get("fallback_to_fpfh", True)
+            semantic_registration = {"dinov2", "gaussian_landmark"}
             registration_fn = lambda s, r: register_submaps_depth(
                 s, r, init_unknown,
                 registration_method=reg_method,
-                feature_extractor=loop_detector._feature_extractor if reg_method == "dinov2" else None,
+                feature_extractor=(
+                    loop_detector._feature_extractor
+                    if reg_method in semantic_registration else None),
                 fallback_to_fpfh=fallback_to_fpfh,
                 registration_options=self.config["submap"].get("registration_options", {}))
             intra_loops = register_agents_submaps_depth(

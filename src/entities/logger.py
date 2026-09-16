@@ -141,6 +141,16 @@ class Logger(object):
             passed_filter = bool(loop.fitness > fitness_threshold and
                                  loop.inlier_rmse < inlier_rmse_threshold)
 
+            coarse_transformation = getattr(loop, "coarse_transformation", None)
+            coarse_rotation_error = None
+            coarse_translation_error = None
+            if coarse_transformation is not None:
+                coarse_transformation = np.asarray(coarse_transformation)
+                coarse_rotation_error = geodesic_rotation_error_deg(
+                    coarse_transformation[:3, :3], reference[:3, :3])
+                coarse_translation_error = float(np.linalg.norm(
+                    coarse_transformation[:3, 3] - reference[:3, 3]) * 100.0)
+
             rows.append({
                 "source_agent_id": loop.source_agent_id,
                 "source_frame_id": loop.source_frame_id,
@@ -155,16 +165,99 @@ class Logger(object):
                 "num_source_features": getattr(loop, "num_source_features", None),
                 "num_target_features": getattr(loop, "num_target_features", None),
                 "num_feature_matches": getattr(loop, "num_feature_matches", None),
+                "num_mutual_matches": getattr(loop, "num_mutual_matches", None),
+                "num_confidence_matches": getattr(
+                    loop, "num_confidence_matches", None),
+                "num_depth_valid_correspondences": getattr(
+                    loop, "num_depth_valid_correspondences",
+                    getattr(loop, "num_correspondences", None)),
+                "num_geometry_consistent_correspondences": getattr(
+                    loop, "num_geometry_consistent_correspondences", None),
                 "num_correspondences": getattr(loop, "num_correspondences", None),
                 "num_ransac_inliers": getattr(loop, "num_ransac_inliers", None),
+                "ransac_inlier_ratio": getattr(
+                    loop, "ransac_inlier_ratio", None),
+                "correspondence_retention_ratio": getattr(
+                    loop, "correspondence_retention_ratio", None),
+                "mean_match_similarity": getattr(
+                    loop, "mean_match_similarity", None),
+                "mean_match_margin": getattr(loop, "mean_match_margin", None),
+                "match_similarity_p10": getattr(loop, "match_similarity_p10", None),
+                "match_similarity_p50": getattr(loop, "match_similarity_p50", None),
+                "match_similarity_p90": getattr(loop, "match_similarity_p90", None),
+                "match_margin_p10": getattr(loop, "match_margin_p10", None),
+                "match_margin_p50": getattr(loop, "match_margin_p50", None),
+                "match_margin_p90": getattr(loop, "match_margin_p90", None),
+                "mean_compatibility_support": getattr(
+                    loop, "mean_compatibility_support", None),
+                "dino_min_similarity": getattr(loop, "dino_min_similarity", None),
+                "dino_min_margin": getattr(loop, "dino_min_margin", None),
+                "dino_keep_top_fraction": getattr(
+                    loop, "dino_keep_top_fraction", None),
+                "dino_depth_window_radius": getattr(
+                    loop, "dino_depth_window_radius", None),
+                "dino_depth_max_mad_m": getattr(
+                    loop, "dino_depth_max_mad_m", None),
+                "dino_compatibility_threshold_m": getattr(
+                    loop, "dino_compatibility_threshold_m", None),
+                "dino_min_compatibility_support": getattr(
+                    loop, "dino_min_compatibility_support", None),
+                "dino_preprocess_mode": getattr(
+                    loop, "dino_preprocess_mode", None),
+                "source_patch_input_height": getattr(
+                    loop, "source_patch_input_height", None),
+                "source_patch_input_width": getattr(
+                    loop, "source_patch_input_width", None),
+                "source_patch_grid_height": getattr(
+                    loop, "source_patch_grid_height", None),
+                "source_patch_grid_width": getattr(
+                    loop, "source_patch_grid_width", None),
+                "target_patch_input_height": getattr(
+                    loop, "target_patch_input_height", None),
+                "target_patch_input_width": getattr(
+                    loop, "target_patch_input_width", None),
+                "target_patch_grid_height": getattr(
+                    loop, "target_patch_grid_height", None),
+                "target_patch_grid_width": getattr(
+                    loop, "target_patch_grid_width", None),
+                "num_gaussians_total": getattr(
+                    loop, "num_gaussians_total", None),
+                "num_gaussians_opacity_valid": getattr(
+                    loop, "num_gaussians_opacity_valid", None),
+                "num_gaussians_in_view": getattr(
+                    loop, "num_gaussians_in_view", None),
+                "num_gaussians_depth_consistent": getattr(
+                    loop, "num_gaussians_depth_consistent", None),
+                "num_gaussian_landmarks": getattr(
+                    loop, "num_gaussian_landmarks", None),
+                "mean_gaussian_landmark_opacity": getattr(
+                    loop, "mean_gaussian_landmark_opacity", None),
+                "mean_gaussian_depth_residual_m": getattr(
+                    loop, "mean_gaussian_depth_residual_m", None),
+                "gaussian_min_opacity": getattr(
+                    loop, "gaussian_min_opacity", None),
+                "gaussian_depth_tolerance_m": getattr(
+                    loop, "gaussian_depth_tolerance_m", None),
+                "gaussian_max_landmarks": getattr(
+                    loop, "gaussian_max_landmarks", None),
+                "gaussian_refit_inliers": getattr(
+                    loop, "gaussian_refit_inliers", None),
                 "coarse_registration_time_s": getattr(
                     loop, "coarse_registration_time", None),
                 "icp_registration_time_s": getattr(
                     loop, "icp_registration_time", None),
+                "coarse_rotation_error_deg": coarse_rotation_error,
+                "coarse_translation_error_cm": coarse_translation_error,
                 "fitness": float(loop.fitness),
                 "inlier_rmse": float(loop.inlier_rmse),
                 "rotation_error_deg": float(rotation_error),
                 "translation_error_cm": translation_error,
+                "icp_rotation_improvement_deg": (
+                    coarse_rotation_error - float(rotation_error)
+                    if coarse_rotation_error is not None else None),
+                "icp_translation_improvement_cm": (
+                    coarse_translation_error - translation_error
+                    if coarse_translation_error is not None else None),
                 "success": success,
                 "passed_filter": passed_filter,
                 "false_negative": success and not passed_filter,
@@ -192,8 +285,40 @@ class Logger(object):
             "mean_fitness": mean_of("fitness"),
             "mean_inlier_rmse": mean_of("inlier_rmse"),
             "mean_feature_matches": mean_of("num_feature_matches"),
-            "mean_depth_valid_correspondences": mean_of("num_correspondences"),
+            "mean_mutual_matches": mean_of("num_mutual_matches"),
+            "mean_confidence_matches": mean_of("num_confidence_matches"),
+            "mean_depth_valid_correspondences": mean_of(
+                "num_depth_valid_correspondences"),
+            "mean_geometry_consistent_correspondences": mean_of(
+                "num_geometry_consistent_correspondences"),
+            "mean_final_correspondences": mean_of("num_correspondences"),
             "mean_ransac_inliers": mean_of("num_ransac_inliers"),
+            "mean_ransac_inlier_ratio": mean_of("ransac_inlier_ratio"),
+            "mean_correspondence_retention_ratio": mean_of(
+                "correspondence_retention_ratio"),
+            "mean_match_similarity": mean_of("mean_match_similarity"),
+            "mean_match_margin": mean_of("mean_match_margin"),
+            "mean_compatibility_support": mean_of(
+                "mean_compatibility_support"),
+            "mean_gaussians_total": mean_of("num_gaussians_total"),
+            "mean_gaussians_opacity_valid": mean_of(
+                "num_gaussians_opacity_valid"),
+            "mean_gaussians_in_view": mean_of("num_gaussians_in_view"),
+            "mean_gaussians_depth_consistent": mean_of(
+                "num_gaussians_depth_consistent"),
+            "mean_gaussian_landmarks": mean_of("num_gaussian_landmarks"),
+            "mean_gaussian_landmark_opacity": mean_of(
+                "mean_gaussian_landmark_opacity"),
+            "mean_gaussian_depth_residual_m": mean_of(
+                "mean_gaussian_depth_residual_m"),
+            "mean_coarse_rotation_error_deg": mean_of(
+                "coarse_rotation_error_deg"),
+            "mean_coarse_translation_error_cm": mean_of(
+                "coarse_translation_error_cm"),
+            "mean_icp_rotation_improvement_deg": mean_of(
+                "icp_rotation_improvement_deg"),
+            "mean_icp_translation_improvement_cm": mean_of(
+                "icp_translation_improvement_cm"),
             "mean_coarse_registration_time_s": mean_of("coarse_registration_time_s"),
             "mean_icp_registration_time_s": mean_of("icp_registration_time_s"),
             "num_passed_filter": sum(row["passed_filter"] for row in rows),

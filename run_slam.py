@@ -19,7 +19,9 @@ def get_args():
     parser.add_argument('--group_name', type=str)
     parser.add_argument(
         '--registration_method',
-        choices=['fpfh', 'dinov2', 'sift', 'orb', 'akaze'],
+        choices=[
+            'fpfh', 'dinov2', 'gaussian_landmark',
+            'sift', 'orb', 'akaze'],
         help='Override submap.registration_method for a comparable experiment run')
     return parser.parse_args()
 
@@ -29,7 +31,8 @@ def update_config_with_args(config, args):
         config["data"]["input_path"] = args.input_path
     if args.output_path:
         config["data"]["output_path"] = args.output_path
-    if args.seed:
+    # Seed 0 is a valid and commonly used benchmark seed.
+    if args.seed is not None:
         config["seed"] = args.seed
     if args.multi_gpu:
         config["multi_gpu"] = True

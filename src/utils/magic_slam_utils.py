@@ -39,10 +39,53 @@ class Registration(object):
         self.num_source_features = None
         self.num_target_features = None
         self.num_feature_matches = None
+        self.num_mutual_matches = None
+        self.num_confidence_matches = None
+        self.num_depth_valid_correspondences = None
+        self.num_geometry_consistent_correspondences = None
         self.num_correspondences = None
         self.num_ransac_inliers = None
+        self.ransac_inlier_ratio = None
+        self.correspondence_retention_ratio = None
+        self.mean_match_similarity = None
+        self.mean_match_margin = None
+        self.match_similarity_p10 = None
+        self.match_similarity_p50 = None
+        self.match_similarity_p90 = None
+        self.match_margin_p10 = None
+        self.match_margin_p50 = None
+        self.match_margin_p90 = None
+        self.mean_compatibility_support = None
+        self.dino_min_similarity = None
+        self.dino_min_margin = None
+        self.dino_keep_top_fraction = None
+        self.dino_depth_window_radius = None
+        self.dino_depth_max_mad_m = None
+        self.dino_compatibility_threshold_m = None
+        self.dino_min_compatibility_support = None
+        self.dino_preprocess_mode = None
+        self.source_patch_input_height = None
+        self.source_patch_input_width = None
+        self.source_patch_grid_height = None
+        self.source_patch_grid_width = None
+        self.target_patch_input_height = None
+        self.target_patch_input_width = None
+        self.target_patch_grid_height = None
+        self.target_patch_grid_width = None
+        self.num_gaussians_total = None
+        self.num_gaussians_opacity_valid = None
+        self.num_gaussians_in_view = None
+        self.num_gaussians_depth_consistent = None
+        self.num_gaussian_landmarks = None
+        self.mean_gaussian_landmark_opacity = None
+        self.mean_gaussian_depth_residual_m = None
+        self.gaussian_min_opacity = None
+        self.gaussian_depth_tolerance_m = None
+        self.gaussian_max_landmarks = None
+        self.gaussian_refit_inliers = None
         self.coarse_registration_time = None
         self.icp_registration_time = None
+        self.coarse_transformation = None
 
 
 def refine_map(gaussian_model, agents_datasets: dict, agents_keyframe_ids: dict, agents_c2ws: dict, iterations=3000):
@@ -220,9 +263,11 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
         initial_transformation_unknown: If True, use a coarse registration as the
             initial guess for inter-agent loops. If False, the odometry-based init_transformation
             set by detect_loops() is used directly (assumes a known relative pose between agents).
-        registration_method: "fpfh", "dinov2", "sift", "orb", or "akaze"
+        registration_method: "fpfh", "dinov2", "gaussian_landmark", "sift",
+            "orb", or "akaze"
             for the coarse registration used when initial_transformation_unknown is True.
-        feature_extractor: DINOv2 feature extractor, required when registration_method="dinov2".
+        feature_extractor: DINOv2 feature extractor, required by "dinov2" and
+            "gaussian_landmark".
         fallback_to_fpfh: If True, use FPFH when a visual method produces too
             few valid correspondences. Disable this for pure extractor benchmarks.
         registration_options: Shared RANSAC/correspondence settings plus sparse
@@ -239,7 +284,9 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
     source_cloud = utils.rgbd2ptcloud(source_color, source_depth, source_submap["intrinsics"], np.eye(4))
     target_cloud = utils.rgbd2ptcloud(target_color, target_depth, target_submap["intrinsics"], np.eye(4))
 
-    supported_methods = {"fpfh", "dinov2", "sift", "orb", "akaze"}
+    supported_methods = {
+        "fpfh", "dinov2", "gaussian_landmark", "sift", "orb", "akaze"
+    }
     registration_method = registration_method.lower()
     if registration_method not in supported_methods:
         raise ValueError(
@@ -263,7 +310,70 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
                 source_submap["intrinsics"], target_submap["intrinsics"], feature_extractor,
                 distance_threshold=ransac_distance_threshold,
                 min_correspondences=min_correspondences,
-                return_diagnostics=True)
+                return_diagnostics=True,
+                min_similarity=registration_options.get(
+                    "dino_min_similarity", -1.0),
+                min_margin=registration_options.get("dino_min_margin", -1.0),
+                keep_top_fraction=registration_options.get(
+                    "dino_keep_top_fraction", 1.0),
+                depth_window_radius=registration_options.get(
+                    "dino_depth_window_radius", 0),
+                depth_max_mad_m=registration_options.get(
+                    "dino_depth_max_mad_m"),
+                compatibility_threshold_m=registration_options.get(
+                    "dino_compatibility_threshold_m", 0.0),
+                min_compatibility_support=registration_options.get(
+                    "dino_min_compatibility_support", 0))
+        elif registration_method == "gaussian_landmark":
+            if (feature_extractor is None or
+                    not hasattr(feature_extractor, "extract_patch_tokens")):
+                raise ValueError(
+                    "Gaussian-landmark registration requires an extractor "
+                    "with extract_patch_tokens().")
+            target_gaussian = utils.load_3dgs(target_submap)
+            try:
+                transform, diagnostics = (
+                    utils.coarse_registration_gaussian_landmark(
+                        source_color=source_color,
+                        source_depth=source_depth,
+                        target_color=target_color,
+                        target_depth=target_depth,
+                        source_intrinsics=source_submap["intrinsics"],
+                        target_intrinsics=target_submap["intrinsics"],
+                        target_gaussian_model=target_gaussian,
+                        target_c2w=np.asarray(target_submap["submap_c2ws"][0]),
+                        feature_extractor=feature_extractor,
+                        distance_threshold=ransac_distance_threshold,
+                        min_correspondences=min_correspondences,
+                        return_diagnostics=True,
+                        min_similarity=registration_options.get(
+                            "dino_min_similarity", -1.0),
+                        min_margin=registration_options.get(
+                            "dino_min_margin", -1.0),
+                        keep_top_fraction=registration_options.get(
+                            "dino_keep_top_fraction", 1.0),
+                        depth_window_radius=registration_options.get(
+                            "dino_depth_window_radius", 0),
+                        depth_max_mad_m=registration_options.get(
+                            "dino_depth_max_mad_m"),
+                        compatibility_threshold_m=registration_options.get(
+                            "dino_compatibility_threshold_m", 0.0),
+                        min_compatibility_support=registration_options.get(
+                            "dino_min_compatibility_support", 0),
+                        gaussian_min_opacity=registration_options.get(
+                            "gaussian_min_opacity", 0.05),
+                        gaussian_depth_tolerance_m=registration_options.get(
+                            "gaussian_depth_tolerance_m", 0.05),
+                        gaussian_max_landmarks=registration_options.get(
+                            "gaussian_max_landmarks", 2048),
+                        gaussian_refit_inliers=registration_options.get(
+                            "gaussian_refit_inliers", True),
+                    )
+                )
+            finally:
+                del target_gaussian
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         elif registration_method in {"sift", "orb", "akaze"}:
             transform, diagnostics = utils.coarse_registration_local_features(
                 source_color, source_depth, target_color, target_depth,
@@ -280,7 +390,16 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
         if (transform is not None and diagnostics and
                 diagnostics["num_ransac_inliers"] < min_ransac_inliers):
             transform = None
-        if diagnostics:
+        if diagnostics and registration_method in {
+                "dinov2", "gaussian_landmark"}:
+            print(f"[registration] {registration_method} correspondence stages: "
+                  f"{diagnostics['num_mutual_matches']} mutual -> "
+                  f"{diagnostics['num_confidence_matches']} confidence -> "
+                  f"{diagnostics['num_depth_valid_correspondences']} depth -> "
+                  f"{diagnostics['num_geometry_consistent_correspondences']} geometry -> "
+                  f"{diagnostics['num_ransac_inliers']} RANSAC inliers "
+                  f"(agent {source_submap['agent_id']} <-> {target_submap['agent_id']})")
+        elif diagnostics:
             print(f"[registration] {registration_method} attempt: "
                   f"{diagnostics['num_feature_matches']} feature matches, "
                   f"{diagnostics['num_correspondences']} depth-valid correspondences, "
@@ -299,6 +418,7 @@ def register_submaps_depth(agents_submaps: dict, registration: Registration,
             registration.coarse_method_used = registration_method
         registration.coarse_registration_time = time.perf_counter() - coarse_start
         registration.init_transformation = transform
+        registration.coarse_transformation = np.asarray(transform).copy()
 
     source_cloud.estimate_normals()
     target_cloud.estimate_normals()

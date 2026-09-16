@@ -335,11 +335,21 @@ def render_rgbd_from_3dgs(submap):
     # Implement the rendering logic here
     render_settings = get_render_settings(submap["width"], submap["height"], submap["intrinsics"], np.linalg.inv(submap["submap_c2ws"][0]))
     gaussian = load_3dgs(submap)
-    render = render_gaussian_model(gaussian, render_settings)
-    color = render["color"].squeeze(0).cpu().permute(1, 2, 0).detach().numpy()
-    color = (color * 255.0 / color.max()).astype(np.uint8)
-    depth = render["depth"].squeeze(0).cpu().detach().numpy()
-    return color, depth
+    try:
+        with torch.no_grad():
+            render = render_gaussian_model(gaussian, render_settings)
+            color = (render["color"].squeeze(0).cpu().permute(1, 2, 0)
+                     .detach().numpy())
+            color_max = float(color.max())
+            if color_max > 0.0:
+                color = color * (255.0 / color_max)
+            color = np.clip(color, 0.0, 255.0).astype(np.uint8)
+            depth = render["depth"].squeeze(0).cpu().detach().numpy()
+        return color, depth
+    finally:
+        del gaussian
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def get_rgbd(submap):
     if "start_rgb" in submap and "start_depth" in submap:
@@ -417,31 +427,133 @@ def patch_idx_to_pixel(patch_idx, grid_w, patch_h_px, patch_w_px):
     return int((col + 0.5) * patch_w_px), int((row + 0.5) * patch_h_px)
 
 
-def _ransac_from_correspondences(src_pts, tgt_pts, distance_threshold):
-    """Estimate a rigid transform from paired 3D points and report inliers."""
+def _ransac_from_correspondences(
+    src_pts,
+    tgt_pts,
+    distance_threshold,
+    refit_inliers=False,
+):
+    """Estimate a rigid transform from paired 3D correspondences.
+
+    RANSAC first finds a geometrically consistent consensus set. When
+    refit_inliers=True, the final rigid transform is re-estimated from
+    all RANSAC inliers rather than retaining the original 3-point
+    hypothesis.
+    """
+    # DINO_RANSAC_CONSENSUS_REFIT_V1
+
+    source_array = np.asarray(src_pts, dtype=np.float64)
+    target_array = np.asarray(tgt_pts, dtype=np.float64)
+
     src_pcd = o3d.geometry.PointCloud(
-        o3d.utility.Vector3dVector(np.asarray(src_pts, dtype=np.float64)))
+        o3d.utility.Vector3dVector(source_array)
+    )
     tgt_pcd = o3d.geometry.PointCloud(
-        o3d.utility.Vector3dVector(np.asarray(tgt_pts, dtype=np.float64)))
-    corres = o3d.utility.Vector2iVector(
-        np.column_stack((np.arange(len(src_pts)), np.arange(len(src_pts)))).astype(np.int32))
-    result = o3d.pipelines.registration.registration_ransac_based_on_correspondence(
-        src_pcd, tgt_pcd, corres, distance_threshold,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-        ransac_n=3,
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 1000))
-    return result.transformation, len(result.correspondence_set)
+        o3d.utility.Vector3dVector(target_array)
+    )
+
+    correspondence_array = np.column_stack(
+        (
+            np.arange(len(source_array)),
+            np.arange(len(source_array)),
+        )
+    ).astype(np.int32)
+
+    correspondences = o3d.utility.Vector2iVector(
+        correspondence_array
+    )
+
+    estimator = (
+        o3d.pipelines.registration
+        .TransformationEstimationPointToPoint(False)
+    )
+
+    result = (
+        o3d.pipelines.registration
+        .registration_ransac_based_on_correspondence(
+            src_pcd,
+            tgt_pcd,
+            correspondences,
+            distance_threshold,
+            estimator,
+            ransac_n=3,
+            criteria=(
+                o3d.pipelines.registration
+                .RANSACConvergenceCriteria(50000, 1000)
+            ),
+        )
+    )
+
+    inlier_array = np.asarray(
+        result.correspondence_set,
+        dtype=np.int32,
+    )
+
+    if inlier_array.size == 0:
+        return result.transformation, 0
+
+    inlier_array = inlier_array.reshape(-1, 2)
+    transform = result.transformation
+
+    if refit_inliers and len(inlier_array) >= 3:
+        inlier_correspondences = o3d.utility.Vector2iVector(
+            inlier_array
+        )
+
+        # Least-squares rigid alignment on the complete consensus set.
+        # With scaling disabled, this is the Kabsch/Umeyama rigid case.
+        transform = estimator.compute_transformation(
+            src_pcd,
+            tgt_pcd,
+            inlier_correspondences,
+        )
+
+    return transform, int(len(inlier_array))
 
 
-def _valid_depth_point(u, v, depth, intrinsics):
-    """Return the back-projected point at a feature location, or None."""
+def _valid_depth_point(u, v, depth, intrinsics, window_radius=0,
+                       max_mad_m=None):
+    """Return a robustly back-projected point, or ``None``.
+
+    ``window_radius=0`` preserves the original center-pixel behaviour. A
+    positive radius uses the median valid depth in the local window. When
+    ``max_mad_m`` is set, windows that cross a strong depth discontinuity are
+    rejected using the median absolute deviation (MAD).
+    """
     u, v = int(round(u)), int(round(v))
     if v < 0 or u < 0 or v >= depth.shape[0] or u >= depth.shape[1]:
         return None
-    value = float(depth[v, u])
-    if not np.isfinite(value) or value <= 0:
+
+    radius = max(0, int(window_radius))
+    v0, v1 = max(0, v - radius), min(depth.shape[0], v + radius + 1)
+    u0, u1 = max(0, u - radius), min(depth.shape[1], u + radius + 1)
+    values = np.asarray(depth[v0:v1, u0:u1], dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values) & (values > 0)]
+    if values.size == 0:
         return None
+
+    value = float(np.median(values))
+    if max_mad_m is not None and float(max_mad_m) >= 0:
+        mad = float(np.median(np.abs(values - value)))
+        if mad > float(max_mad_m):
+            return None
     return unproject(u, v, value, intrinsics)
+
+
+def _rigidity_compatibility_mask(src_pts, tgt_pts, distance_threshold,
+                                 min_support):
+    """Keep matches supported by pairwise rigid-distance consistency."""
+    src_pts = np.asarray(src_pts, dtype=np.float64)
+    tgt_pts = np.asarray(tgt_pts, dtype=np.float64)
+    count = len(src_pts)
+    if count == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=np.int32)
+
+    src_dist = np.linalg.norm(src_pts[:, None, :] - src_pts[None, :, :], axis=2)
+    tgt_dist = np.linalg.norm(tgt_pts[:, None, :] - tgt_pts[None, :, :], axis=2)
+    compatible = np.abs(src_dist - tgt_dist) <= float(distance_threshold)
+    support = compatible.sum(axis=1).astype(np.int32) - 1
+    return support >= int(min_support), support
 
 
 def _create_local_feature_detector(method, max_keypoints):
@@ -478,8 +590,14 @@ def coarse_registration_local_features(source_color, source_depth, target_color,
         "num_source_features": len(src_kp),
         "num_target_features": len(tgt_kp),
         "num_feature_matches": 0,
+        "num_mutual_matches": 0,
+        "num_confidence_matches": 0,
+        "num_depth_valid_correspondences": 0,
+        "num_geometry_consistent_correspondences": 0,
         "num_correspondences": 0,
         "num_ransac_inliers": 0,
+        "ransac_inlier_ratio": 0.0,
+        "correspondence_retention_ratio": 0.0,
     }
     if src_desc is None or tgt_desc is None or len(src_desc) < 2 or len(tgt_desc) < 2:
         return None, diagnostics
@@ -499,6 +617,8 @@ def coarse_registration_local_features(source_color, source_depth, target_color,
                for source_idx, target_idx in source_to_target.items()
                if target_to_source.get(target_idx) == source_idx]
     diagnostics["num_feature_matches"] = len(matches)
+    diagnostics["num_mutual_matches"] = len(matches)
+    diagnostics["num_confidence_matches"] = len(matches)
 
     src_pts, tgt_pts = [], []
     for source_idx, target_idx in matches:
@@ -511,67 +631,559 @@ def coarse_registration_local_features(source_color, source_depth, target_color,
         src_pts.append(source_point)
         tgt_pts.append(target_point)
 
+    diagnostics["num_depth_valid_correspondences"] = len(src_pts)
+    diagnostics["num_geometry_consistent_correspondences"] = len(src_pts)
     diagnostics["num_correspondences"] = len(src_pts)
+    diagnostics["correspondence_retention_ratio"] = (
+        float(len(src_pts)) / len(matches) if matches else 0.0)
     if len(src_pts) < min_correspondences:
         return None, diagnostics
 
     transform, num_inliers = _ransac_from_correspondences(
         src_pts, tgt_pts, distance_threshold)
     diagnostics["num_ransac_inliers"] = num_inliers
+    diagnostics["ransac_inlier_ratio"] = (
+        float(num_inliers) / len(src_pts) if src_pts else 0.0)
     return transform, diagnostics
+
+
+
+# DINO_SPATIAL_HELPER_V2
+def _spatially_balanced_match_indices(
+    matched_src,
+    matched_tgt,
+    confidence,
+    src_grid_height,
+    src_grid_width,
+    tgt_grid_height,
+    tgt_grid_width,
+    balance_rows=5,
+    balance_cols=7,
+    max_per_cell=8,
+):
+    """Keep confident matches while preserving spatial coverage."""
+    if matched_src.numel() == 0:
+        return torch.empty(
+            0,
+            dtype=torch.long,
+            device=matched_src.device,
+        )
+
+    if balance_rows <= 0 or balance_cols <= 0 or max_per_cell <= 0:
+        return torch.arange(
+            matched_src.numel(),
+            dtype=torch.long,
+            device=matched_src.device,
+        )
+
+    ranked_indices = torch.argsort(
+        confidence,
+        descending=True,
+    ).detach().cpu().tolist()
+
+    source_counts = np.zeros(
+        (balance_rows, balance_cols),
+        dtype=np.int32,
+    )
+    target_counts = np.zeros(
+        (balance_rows, balance_cols),
+        dtype=np.int32,
+    )
+
+    selected_indices = []
+
+    for match_index in ranked_indices:
+        source_index = int(matched_src[match_index].item())
+        target_index = int(matched_tgt[match_index].item())
+
+        source_row = source_index // src_grid_width
+        source_col = source_index % src_grid_width
+
+        target_row = target_index // tgt_grid_width
+        target_col = target_index % tgt_grid_width
+
+        source_cell_row = min(
+            balance_rows - 1,
+            source_row * balance_rows // max(1, src_grid_height),
+        )
+        source_cell_col = min(
+            balance_cols - 1,
+            source_col * balance_cols // max(1, src_grid_width),
+        )
+
+        target_cell_row = min(
+            balance_rows - 1,
+            target_row * balance_rows // max(1, tgt_grid_height),
+        )
+        target_cell_col = min(
+            balance_cols - 1,
+            target_col * balance_cols // max(1, tgt_grid_width),
+        )
+
+        source_cell_full = (
+            source_counts[source_cell_row, source_cell_col]
+            >= max_per_cell
+        )
+        target_cell_full = (
+            target_counts[target_cell_row, target_cell_col]
+            >= max_per_cell
+        )
+
+        if source_cell_full or target_cell_full:
+            continue
+
+        selected_indices.append(match_index)
+
+        source_counts[source_cell_row, source_cell_col] += 1
+        target_counts[target_cell_row, target_cell_col] += 1
+
+    return torch.as_tensor(
+        selected_indices,
+        dtype=torch.long,
+        device=matched_src.device,
+    )
 
 
 def coarse_registration_dinov2(source_color, source_depth, target_color, target_depth,
                                 source_intrinsics, target_intrinsics,
                                 feature_extractor, distance_threshold=0.05,
-                                min_correspondences=8, return_diagnostics=False):
-    """ DINOv2 patch mutual-NN correspondences -> 3D lift via depth -> RANSAC
-        (Umeyama/Kabsch on known correspondences).
-    Returns:
-        (transform, num_correspondences) -- transform is a 4x4 np.ndarray or
-        None if there were not enough valid correspondences; num_correspondences
-        is always an int so the caller can log why it failed. """
+                                min_correspondences=8, return_diagnostics=False,
+                                min_similarity=-1.0, min_margin=-1.0,
+                                keep_top_fraction=1.0, depth_window_radius=0,
+                                depth_max_mad_m=None,
+                                compatibility_threshold_m=0.0,
+                                min_compatibility_support=0):
+    """DINOv2 patch matching -> confidence/depth/rigidity filters -> RANSAC.
+
+    Defaults preserve the original mutual-nearest-neighbour path. The extra
+    filters are configurable so the unfiltered DINOv2-Geo baseline and the
+    correspondence-aware variant can be compared on identical loop pairs.
+    """
     from PIL import Image
-    src_tok, (gh, gw), (ph, pw) = feature_extractor.extract_patch_tokens(Image.fromarray(source_color))
-    tgt_tok, _, _ = feature_extractor.extract_patch_tokens(Image.fromarray(target_color))
+    src_tok, (src_gh, src_gw), (src_ph, src_pw), src_meta = (
+        feature_extractor.extract_patch_tokens(
+            Image.fromarray(source_color), return_metadata=True))
+    tgt_tok, (tgt_gh, tgt_gw), (tgt_ph, tgt_pw), tgt_meta = (
+        feature_extractor.extract_patch_tokens(
+            Image.fromarray(target_color), return_metadata=True))
 
     diagnostics = {
         "num_source_features": int(src_tok.shape[0]),
         "num_target_features": int(tgt_tok.shape[0]),
         "num_feature_matches": 0,
+        "num_mutual_matches": 0,
+        "num_confidence_matches": 0,
+        "num_depth_valid_correspondences": 0,
+        "num_geometry_consistent_correspondences": 0,
         "num_correspondences": 0,
         "num_ransac_inliers": 0,
+        "ransac_inlier_ratio": 0.0,
+        "correspondence_retention_ratio": 0.0,
+        "mean_match_similarity": None,
+        "mean_match_margin": None,
+        "match_similarity_p10": None,
+        "match_similarity_p50": None,
+        "match_similarity_p90": None,
+        "match_margin_p10": None,
+        "match_margin_p50": None,
+        "match_margin_p90": None,
+        "mean_compatibility_support": None,
+        "dino_min_similarity": float(min_similarity),
+        "dino_min_margin": float(min_margin),
+        "dino_keep_top_fraction": float(keep_top_fraction),
+        "dino_depth_window_radius": int(depth_window_radius),
+        "dino_depth_max_mad_m": (None if depth_max_mad_m is None
+                                  else float(depth_max_mad_m)),
+        "dino_compatibility_threshold_m": float(compatibility_threshold_m),
+        "dino_min_compatibility_support": int(min_compatibility_support),
+        "dino_preprocess_mode": src_meta["dino_preprocess_mode"],
+        "source_patch_input_height": src_meta["patch_input_height"],
+        "source_patch_input_width": src_meta["patch_input_width"],
+        "source_patch_grid_height": src_meta["patch_grid_height"],
+        "source_patch_grid_width": src_meta["patch_grid_width"],
+        "target_patch_input_height": tgt_meta["patch_input_height"],
+        "target_patch_input_width": tgt_meta["patch_input_width"],
+        "target_patch_grid_height": tgt_meta["patch_grid_height"],
+        "target_patch_grid_width": tgt_meta["patch_grid_width"],
     }
 
+    if not 0 < float(keep_top_fraction) <= 1:
+        raise ValueError("keep_top_fraction must be in (0, 1].")
+
     sim = src_tok @ tgt_tok.T
-    s2t = sim.argmax(dim=1)
-    t2s = sim.argmax(dim=0)
+    src_k = min(2, sim.shape[1])
+    tgt_k = min(2, sim.shape[0])
+    src_values, src_indices = sim.topk(k=src_k, dim=1)
+    tgt_values, tgt_indices = sim.topk(k=tgt_k, dim=0)
+    s2t = src_indices[:, 0]
+    t2s = tgt_indices[0, :]
     mutual = t2s[s2t] == torch.arange(s2t.shape[0], device=sim.device)
     matched_src = torch.nonzero(mutual).squeeze(1)
-    diagnostics["num_feature_matches"] = int(matched_src.numel())
+    matched_tgt = s2t[matched_src]
+    match_similarity = src_values[matched_src, 0]
+    src_margin = (src_values[matched_src, 0] - src_values[matched_src, 1]
+                  if src_k == 2 else torch.full_like(match_similarity, float("inf")))
+    tgt_margin = (tgt_values[0, matched_tgt] - tgt_values[1, matched_tgt]
+                  if tgt_k == 2 else torch.full_like(match_similarity, float("inf")))
+    match_margin = torch.minimum(src_margin, tgt_margin)
+
+    num_mutual = int(matched_src.numel())
+    diagnostics["num_feature_matches"] = num_mutual
+    diagnostics["num_mutual_matches"] = num_mutual
+    if num_mutual:
+        similarities_np = match_similarity.detach().cpu().numpy()
+        margins_np = match_margin.detach().cpu().numpy()
+        diagnostics["match_similarity_p10"] = float(np.percentile(similarities_np, 10))
+        diagnostics["match_similarity_p50"] = float(np.percentile(similarities_np, 50))
+        diagnostics["match_similarity_p90"] = float(np.percentile(similarities_np, 90))
+        diagnostics["match_margin_p10"] = float(np.percentile(margins_np, 10))
+        diagnostics["match_margin_p50"] = float(np.percentile(margins_np, 50))
+        diagnostics["match_margin_p90"] = float(np.percentile(margins_np, 90))
+
+    confidence_mask = ((match_similarity >= float(min_similarity)) &
+                       (match_margin >= float(min_margin)))
+    matched_src = matched_src[confidence_mask]
+    matched_tgt = matched_tgt[confidence_mask]
+    match_similarity = match_similarity[confidence_mask]
+    match_margin = match_margin[confidence_mask]
+
+    if matched_src.numel() and float(keep_top_fraction) < 1.0:
+        keep_count = max(
+            int(min_correspondences),
+            int(np.ceil(matched_src.numel() * float(keep_top_fraction))))
+        keep_count = min(keep_count, int(matched_src.numel()))
+        confidence = match_similarity + match_margin
+        keep_indices = confidence.topk(keep_count, largest=True).indices
+        matched_src = matched_src[keep_indices]
+        matched_tgt = matched_tgt[keep_indices]
+        match_similarity = match_similarity[keep_indices]
+        match_margin = match_margin[keep_indices]
+
+
+    diagnostics["num_confidence_matches"] = int(matched_src.numel())
+
+    # DINO_SPATIAL_SELECTION_V2
+    # Baseline dinov2: min_similarity=-1 va min_margin=-1,
+    # do do khong bi thay doi.
+    use_spatial_balance = (
+        matched_src.numel() > 0
+        and (
+            float(min_similarity) >= 0.0
+            or float(min_margin) >= 0.0
+        )
+    )
+
+    if use_spatial_balance:
+        confidence = match_similarity + match_margin
+
+        spatial_indices = _spatially_balanced_match_indices(
+            matched_src=matched_src,
+            matched_tgt=matched_tgt,
+            confidence=confidence,
+            src_grid_height=src_gh,
+            src_grid_width=src_gw,
+            tgt_grid_height=tgt_gh,
+            tgt_grid_width=tgt_gw,
+            balance_rows=5,
+            balance_cols=7,
+            max_per_cell=8,
+        )
+
+        matched_src = matched_src[spatial_indices]
+        matched_tgt = matched_tgt[spatial_indices]
+        match_similarity = match_similarity[spatial_indices]
+        match_margin = match_margin[spatial_indices]
+
+    if matched_src.numel():
+        diagnostics["mean_match_similarity"] = float(match_similarity.mean().item())
+        diagnostics["mean_match_margin"] = float(match_margin.mean().item())
     if matched_src.numel() < min_correspondences:
         return (None, diagnostics) if return_diagnostics else (None, int(matched_src.numel()))
-    matched_tgt = s2t[matched_src]
 
     src_pts, tgt_pts = [], []
     for si, ti in zip(matched_src.tolist(), matched_tgt.tolist()):
-        u_s, v_s = patch_idx_to_pixel(si, gw, ph, pw)
-        u_t, v_t = patch_idx_to_pixel(ti, gw, ph, pw)
-        source_point = _valid_depth_point(u_s, v_s, source_depth, source_intrinsics)
-        target_point = _valid_depth_point(u_t, v_t, target_depth, target_intrinsics)
+        u_s, v_s = patch_idx_to_pixel(si, src_gw, src_ph, src_pw)
+        u_t, v_t = patch_idx_to_pixel(ti, tgt_gw, tgt_ph, tgt_pw)
+        source_point = _valid_depth_point(
+            u_s, v_s, source_depth, source_intrinsics,
+            window_radius=depth_window_radius, max_mad_m=depth_max_mad_m)
+        target_point = _valid_depth_point(
+            u_t, v_t, target_depth, target_intrinsics,
+            window_radius=depth_window_radius, max_mad_m=depth_max_mad_m)
         if source_point is None or target_point is None:
             continue
         src_pts.append(source_point)
         tgt_pts.append(target_point)
 
+    diagnostics["num_depth_valid_correspondences"] = len(src_pts)
+    if len(src_pts) < min_correspondences:
+        diagnostics["num_correspondences"] = len(src_pts)
+        return (None, diagnostics) if return_diagnostics else (None, len(src_pts))
+
+    if (float(compatibility_threshold_m) > 0 and
+            int(min_compatibility_support) > 0):
+        compatibility_mask, support = _rigidity_compatibility_mask(
+            src_pts, tgt_pts, compatibility_threshold_m,
+            min_compatibility_support)
+        diagnostics["mean_compatibility_support"] = float(np.mean(support))
+        src_pts = np.asarray(src_pts)[compatibility_mask].tolist()
+        tgt_pts = np.asarray(tgt_pts)[compatibility_mask].tolist()
+
+    diagnostics["num_geometry_consistent_correspondences"] = len(src_pts)
     diagnostics["num_correspondences"] = len(src_pts)
+    diagnostics["correspondence_retention_ratio"] = (
+        float(len(src_pts)) / num_mutual if num_mutual else 0.0)
     if len(src_pts) < min_correspondences:
         return (None, diagnostics) if return_diagnostics else (None, len(src_pts))
 
+    # Refit chi duoc bat cho filtered DINOv2-Corr.
+    # Baseline co min_similarity=min_margin=-1.
+    use_consensus_refit = (
+        float(min_similarity) >= 0.0
+        or float(min_margin) >= 0.0
+    )
+
+    diagnostics["ransac_consensus_refit"] = bool(
+        use_consensus_refit
+    )
+
     transform, num_inliers = _ransac_from_correspondences(
-        src_pts, tgt_pts, distance_threshold)
+        src_pts,
+        tgt_pts,
+        distance_threshold,
+        refit_inliers=use_consensus_refit,
+    )
     diagnostics["num_ransac_inliers"] = num_inliers
+    diagnostics["ransac_inlier_ratio"] = (
+        float(num_inliers) / len(src_pts) if src_pts else 0.0)
     return (transform, diagnostics) if return_diagnostics else (transform, len(src_pts))
+
+
+def coarse_registration_gaussian_landmark(
+        source_color, source_depth, target_color, target_depth,
+        source_intrinsics, target_intrinsics, target_gaussian_model,
+        target_c2w, feature_extractor, distance_threshold=0.05,
+        min_correspondences=8, return_diagnostics=False,
+        min_similarity=-1.0, min_margin=-1.0,
+        keep_top_fraction=1.0, depth_window_radius=0,
+        depth_max_mad_m=None, compatibility_threshold_m=0.0,
+        min_compatibility_support=0, gaussian_min_opacity=0.05,
+        gaussian_depth_tolerance_m=0.05, gaussian_max_landmarks=2048,
+        gaussian_refit_inliers=True):
+    """Register a source RGB-D view against target 3D Gaussian landmarks.
+
+    DINO patch tokens describe both images, but the target 3D coordinates are
+    optimized Gaussian centres rather than target depth pixels.  The centres
+    are projected into the target reference view, checked against its rendered
+    or captured depth, and associated one-to-one with target patch tokens.
+    """
+    from PIL import Image
+    from src.utils.gaussian_landmarks import (
+        build_single_view_gaussian_landmarks,
+    )
+
+    src_tok, (src_gh, src_gw), (src_ph, src_pw), src_meta = (
+        feature_extractor.extract_patch_tokens(
+            Image.fromarray(source_color), return_metadata=True))
+    tgt_tok, (tgt_gh, tgt_gw), _, tgt_meta = (
+        feature_extractor.extract_patch_tokens(
+            Image.fromarray(target_color), return_metadata=True))
+
+    landmark_desc, landmark_points, landmark_patch_ids, landmark_diag = (
+        build_single_view_gaussian_landmarks(
+            gaussian_model=target_gaussian_model,
+            reference_depth=target_depth,
+            intrinsics=target_intrinsics,
+            reference_c2w=target_c2w,
+            patch_tokens=tgt_tok,
+            patch_grid_shape=(tgt_gh, tgt_gw),
+            min_opacity=gaussian_min_opacity,
+            depth_tolerance_m=gaussian_depth_tolerance_m,
+            max_landmarks=gaussian_max_landmarks,
+        )
+    )
+
+    diagnostics = {
+        "num_source_features": int(src_tok.shape[0]),
+        "num_target_features": int(tgt_tok.shape[0]),
+        "num_feature_matches": 0,
+        "num_mutual_matches": 0,
+        "num_confidence_matches": 0,
+        "num_depth_valid_correspondences": 0,
+        "num_geometry_consistent_correspondences": 0,
+        "num_correspondences": 0,
+        "num_ransac_inliers": 0,
+        "ransac_inlier_ratio": 0.0,
+        "correspondence_retention_ratio": 0.0,
+        "mean_match_similarity": None,
+        "mean_match_margin": None,
+        "match_similarity_p10": None,
+        "match_similarity_p50": None,
+        "match_similarity_p90": None,
+        "match_margin_p10": None,
+        "match_margin_p50": None,
+        "match_margin_p90": None,
+        "mean_compatibility_support": None,
+        "dino_min_similarity": float(min_similarity),
+        "dino_min_margin": float(min_margin),
+        "dino_keep_top_fraction": float(keep_top_fraction),
+        "dino_depth_window_radius": int(depth_window_radius),
+        "dino_depth_max_mad_m": (
+            None if depth_max_mad_m is None else float(depth_max_mad_m)),
+        "dino_compatibility_threshold_m": float(compatibility_threshold_m),
+        "dino_min_compatibility_support": int(min_compatibility_support),
+        "dino_preprocess_mode": src_meta["dino_preprocess_mode"],
+        "source_patch_input_height": src_meta["patch_input_height"],
+        "source_patch_input_width": src_meta["patch_input_width"],
+        "source_patch_grid_height": src_meta["patch_grid_height"],
+        "source_patch_grid_width": src_meta["patch_grid_width"],
+        "target_patch_input_height": tgt_meta["patch_input_height"],
+        "target_patch_input_width": tgt_meta["patch_input_width"],
+        "target_patch_grid_height": tgt_meta["patch_grid_height"],
+        "target_patch_grid_width": tgt_meta["patch_grid_width"],
+        "gaussian_min_opacity": float(gaussian_min_opacity),
+        "gaussian_depth_tolerance_m": float(gaussian_depth_tolerance_m),
+        "gaussian_max_landmarks": int(gaussian_max_landmarks),
+        "gaussian_refit_inliers": bool(gaussian_refit_inliers),
+        **landmark_diag,
+    }
+
+    if not 0.0 < float(keep_top_fraction) <= 1.0:
+        raise ValueError("keep_top_fraction must be in (0, 1].")
+    if landmark_desc.shape[0] < int(min_correspondences):
+        return ((None, diagnostics) if return_diagnostics
+                else (None, int(landmark_desc.shape[0])))
+
+    similarity = src_tok @ landmark_desc.T
+    src_k = min(2, similarity.shape[1])
+    tgt_k = min(2, similarity.shape[0])
+    src_values, src_indices = similarity.topk(k=src_k, dim=1)
+    tgt_values, tgt_indices = similarity.topk(k=tgt_k, dim=0)
+    source_to_landmark = src_indices[:, 0]
+    landmark_to_source = tgt_indices[0, :]
+    mutual = (
+        landmark_to_source[source_to_landmark]
+        == torch.arange(source_to_landmark.shape[0], device=similarity.device)
+    )
+    matched_src = torch.nonzero(mutual).squeeze(1)
+    matched_landmark = source_to_landmark[matched_src]
+    match_similarity = src_values[matched_src, 0]
+    src_margin = (
+        src_values[matched_src, 0] - src_values[matched_src, 1]
+        if src_k == 2 else torch.full_like(match_similarity, float("inf")))
+    tgt_margin = (
+        tgt_values[0, matched_landmark] - tgt_values[1, matched_landmark]
+        if tgt_k == 2 else torch.full_like(match_similarity, float("inf")))
+    match_margin = torch.minimum(src_margin, tgt_margin)
+
+    num_mutual = int(matched_src.numel())
+    diagnostics["num_feature_matches"] = num_mutual
+    diagnostics["num_mutual_matches"] = num_mutual
+    if num_mutual:
+        similarities_np = match_similarity.detach().cpu().numpy()
+        margins_np = match_margin.detach().cpu().numpy()
+        for percentile in (10, 50, 90):
+            diagnostics[f"match_similarity_p{percentile}"] = float(
+                np.percentile(similarities_np, percentile))
+            diagnostics[f"match_margin_p{percentile}"] = float(
+                np.percentile(margins_np, percentile))
+
+    confidence_mask = (
+        (match_similarity >= float(min_similarity))
+        & (match_margin >= float(min_margin))
+    )
+    matched_src = matched_src[confidence_mask]
+    matched_landmark = matched_landmark[confidence_mask]
+    match_similarity = match_similarity[confidence_mask]
+    match_margin = match_margin[confidence_mask]
+
+    if matched_src.numel() and float(keep_top_fraction) < 1.0:
+        keep_count = max(
+            int(min_correspondences),
+            int(np.ceil(matched_src.numel() * float(keep_top_fraction))))
+        keep_count = min(keep_count, int(matched_src.numel()))
+        keep_indices = (match_similarity + match_margin).topk(
+            keep_count, largest=True).indices
+        matched_src = matched_src[keep_indices]
+        matched_landmark = matched_landmark[keep_indices]
+        match_similarity = match_similarity[keep_indices]
+        match_margin = match_margin[keep_indices]
+
+    diagnostics["num_confidence_matches"] = int(matched_src.numel())
+    if matched_src.numel():
+        landmark_patch_tensor = torch.as_tensor(
+            landmark_patch_ids, device=matched_landmark.device,
+            dtype=torch.long)
+        matched_target_patch = landmark_patch_tensor[matched_landmark]
+        spatial_indices = _spatially_balanced_match_indices(
+            matched_src=matched_src,
+            matched_tgt=matched_target_patch,
+            confidence=match_similarity + match_margin,
+            src_grid_height=src_gh,
+            src_grid_width=src_gw,
+            tgt_grid_height=tgt_gh,
+            tgt_grid_width=tgt_gw,
+            balance_rows=5,
+            balance_cols=7,
+            max_per_cell=8,
+        )
+        matched_src = matched_src[spatial_indices]
+        matched_landmark = matched_landmark[spatial_indices]
+        match_similarity = match_similarity[spatial_indices]
+        match_margin = match_margin[spatial_indices]
+
+    if matched_src.numel():
+        diagnostics["mean_match_similarity"] = float(
+            match_similarity.mean().item())
+        diagnostics["mean_match_margin"] = float(match_margin.mean().item())
+    if matched_src.numel() < int(min_correspondences):
+        return ((None, diagnostics) if return_diagnostics
+                else (None, int(matched_src.numel())))
+
+    matched_landmark_np = matched_landmark.detach().cpu().numpy()
+    src_pts, tgt_pts = [], []
+    for source_patch, landmark_index in zip(
+            matched_src.tolist(), matched_landmark_np.tolist()):
+        u_s, v_s = patch_idx_to_pixel(source_patch, src_gw, src_ph, src_pw)
+        source_point = _valid_depth_point(
+            u_s, v_s, source_depth, source_intrinsics,
+            window_radius=depth_window_radius,
+            max_mad_m=depth_max_mad_m)
+        if source_point is None:
+            continue
+        src_pts.append(source_point)
+        tgt_pts.append(landmark_points[landmark_index])
+
+    diagnostics["num_depth_valid_correspondences"] = len(src_pts)
+    if len(src_pts) < int(min_correspondences):
+        diagnostics["num_correspondences"] = len(src_pts)
+        return ((None, diagnostics) if return_diagnostics
+                else (None, len(src_pts)))
+
+    if (float(compatibility_threshold_m) > 0.0
+            and int(min_compatibility_support) > 0):
+        compatibility_mask, support = _rigidity_compatibility_mask(
+            src_pts, tgt_pts, compatibility_threshold_m,
+            min_compatibility_support)
+        diagnostics["mean_compatibility_support"] = float(np.mean(support))
+        src_pts = np.asarray(src_pts)[compatibility_mask].tolist()
+        tgt_pts = np.asarray(tgt_pts)[compatibility_mask].tolist()
+
+    diagnostics["num_geometry_consistent_correspondences"] = len(src_pts)
+    diagnostics["num_correspondences"] = len(src_pts)
+    diagnostics["correspondence_retention_ratio"] = (
+        float(len(src_pts)) / num_mutual if num_mutual else 0.0)
+    if len(src_pts) < int(min_correspondences):
+        return ((None, diagnostics) if return_diagnostics
+                else (None, len(src_pts)))
+
+    transform, num_inliers = _ransac_from_correspondences(
+        src_pts, tgt_pts, distance_threshold,
+        refit_inliers=bool(gaussian_refit_inliers))
+    diagnostics["num_ransac_inliers"] = num_inliers
+    diagnostics["ransac_inlier_ratio"] = float(num_inliers) / len(src_pts)
+    return ((transform, diagnostics) if return_diagnostics
+            else (transform, len(src_pts)))
 
 def geodesic_rotation_error_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
     """ Sign-ambiguity-free rotation error in degrees between two 3x3
